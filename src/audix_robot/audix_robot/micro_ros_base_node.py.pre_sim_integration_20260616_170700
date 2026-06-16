@@ -9,7 +9,6 @@ the ESP32 micro-ROS topics.
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 from typing import Any
@@ -18,15 +17,12 @@ import rclpy
 from audix_robot.navigation_contract import body_delta_to_world
 from audix_interfaces.msg import EspTelemetry
 from audix_interfaces.srv import Move, RawCommand, TwistCommand
-from geometry_msgs.msg import TransformStamped
-from nav_msgs.msg import Odometry
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from tf2_ros import TransformBroadcaster
 
 
 DEFAULT_MOVE_TIMEOUT_S = 180.0
@@ -81,9 +77,7 @@ class AudixMicroRosBase(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         self.frame_id = str(self.declare_parameter("frame_id", "odom").value)
-        self.base_frame_id = str(self.declare_parameter("base_frame_id", "base_footprint").value)
-        self.publish_odom = bool(self.declare_parameter("publish_odom", True).value)
-        self.publish_tf = bool(self.declare_parameter("publish_tf", True).value)
+        self.base_frame_id = str(self.declare_parameter("base_frame_id", "base_link").value)
         self.move_timeout_s = float(self.declare_parameter("move_timeout_s", DEFAULT_MOVE_TIMEOUT_S).value)
         self.init_imu_on_start = bool(self.declare_parameter("init_imu_on_start", True).value)
         self.reset_odom_on_start = bool(self.declare_parameter("reset_odom_on_start", True).value)
@@ -100,8 +94,6 @@ class AudixMicroRosBase(Node):
 
         self.telemetry_pub = self.create_publisher(EspTelemetry, "esp/telemetry", 10)
         self.telemetry_raw_pub = self.create_publisher(String, "esp/telemetry_raw", 10)
-        self.odom_pub = self.create_publisher(Odometry, "odom", 10) if self.publish_odom else None
-        self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
 
         esp_command_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         esp_telemetry_qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -234,40 +226,6 @@ class AudixMicroRosBase(Node):
         raw_msg = String()
         raw_msg.data = raw
         self.telemetry_raw_pub.publish(raw_msg)
-        self._publish_odom_and_tf(now, msg)
-
-    @staticmethod
-    def _yaw_quaternion(yaw_deg: float) -> tuple[float, float]:
-        yaw_rad = math.radians(float(yaw_deg))
-        return math.sin(yaw_rad * 0.5), math.cos(yaw_rad * 0.5)
-
-    def _publish_odom_and_tf(self, stamp, telemetry: EspTelemetry) -> None:
-        qz, qw = self._yaw_quaternion(telemetry.yaw_deg)
-        x_m = float(telemetry.forward_cm) / 100.0
-        y_m = float(telemetry.strafe_cm) / 100.0
-
-        if self.odom_pub is not None:
-            odom = Odometry()
-            odom.header.stamp = stamp
-            odom.header.frame_id = self.frame_id
-            odom.child_frame_id = self.base_frame_id
-            odom.pose.pose.position.x = x_m
-            odom.pose.pose.position.y = y_m
-            odom.pose.pose.orientation.z = qz
-            odom.pose.pose.orientation.w = qw
-            odom.twist.twist.angular.z = math.radians(float(telemetry.gyro_filt_dps))
-            self.odom_pub.publish(odom)
-
-        if self.tf_broadcaster is not None:
-            transform = TransformStamped()
-            transform.header.stamp = stamp
-            transform.header.frame_id = self.frame_id
-            transform.child_frame_id = self.base_frame_id
-            transform.transform.translation.x = x_m
-            transform.transform.translation.y = y_m
-            transform.transform.rotation.z = qz
-            transform.transform.rotation.w = qw
-            self.tf_broadcaster.sendTransform(transform)
 
     @staticmethod
     def _float4(values: Any) -> list[float]:

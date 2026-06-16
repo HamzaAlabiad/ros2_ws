@@ -46,7 +46,16 @@ FRONT_WATCH_SENSORS = {"front", "front_left", "front_right"}
 SIDE_WATCH_SENSORS = {"left", "right"}
 ALL_WATCH_SENSORS = FRONT_WATCH_SENSORS | SIDE_WATCH_SENSORS
 
-MAP_MOVE_OK_RESULTS = {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "back_falling", "none"}
+MAP_SETPOINT_REACHED_RESULT = "setpoint_reached"
+MAP_MOVE_OK_RESULTS = {
+    "completed",
+    "front_dynamic_clear",
+    "side_falling",
+    "corner_falling",
+    "back_falling",
+    "none",
+    MAP_SETPOINT_REACHED_RESULT,
+}
 
 
 @dataclass(frozen=True)
@@ -108,7 +117,6 @@ class MissionArgs:
     front_corner_strafe_distance: float = 0.15
     front_advance_distance: float = 0.20
     front_strafe_search_distance: float = 1.20
-    front_corner_clear_trim_distance: float = 0.02
     front_corner_buffer_distance: float = 0.05
     front_strafe_search_timeout: float = 8.0
     front_corner_buffer_timeout: float = 1.25
@@ -236,7 +244,11 @@ class RobotManager(Node):
     def __init__(self) -> None:
         super().__init__("robot_manager")
         self.callback_group = ReentrantCallbackGroup()
-        self.mode = "manual"
+        initial_mode = str(self.declare_parameter("initial_mode", "manual").value).strip().lower()
+        self.mode = initial_mode if initial_mode in {"manual", "mission", "idle"} else "manual"
+        self.stop_mode = str(self.declare_parameter("stop_mode", "manual").value).strip().lower()
+        if self.stop_mode not in {"manual", "mission", "idle"}:
+            self.stop_mode = "manual"
         self.mode_lock = threading.Lock()
         self.motion_lock = threading.Lock()
         self.latest_ir = {name: False for name in IR_SENSOR_ORDER}
@@ -248,13 +260,39 @@ class RobotManager(Node):
         self.manual_stop_last_s = 0.0
         self.mission_running = False
         self.cancel_mission = threading.Event()
+        self._configure_store_map_from_params()
         self.map_pose = AudixStoreMap.SPAWN
         self.current_audit_side: int | None = None
         self.front_avoidance_bias_override: int | None = None
+        self.front_avoidance_bias_override_reason: str = ""
 
         self.args = MissionArgs(
             goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
             front_dynamic_hold=float(self.declare_parameter("front_dynamic_hold_s", 3.0).value),
+            front_strafe_search_distance=float(
+                self.declare_parameter("front_strafe_search_distance_m", 1.20).value
+            ),
+            front_strafe_search_timeout=float(
+                self.declare_parameter("front_strafe_search_timeout_s", 8.0).value
+            ),
+            side_follow_search_distance=float(
+                self.declare_parameter("side_follow_search_distance_m", 3.00).value
+            ),
+            side_follow_watch_front=bool(
+                self.declare_parameter("side_follow_watch_front", False).value
+            ),
+            front_advance_distance=float(
+                self.declare_parameter("front_advance_distance_m", 0.20).value
+            ),
+            front_advance_timeout=float(
+                self.declare_parameter("front_advance_timeout_s", 4.0).value
+            ),
+            rejoin_tolerance=float(self.declare_parameter("rejoin_tolerance_m", 0.02).value),
+            max_recenter_attempts=int(self.declare_parameter("max_recenter_attempts", 8).value),
+            max_goal_correction_attempts=int(
+                self.declare_parameter("max_goal_correction_attempts", 4).value
+            ),
+            max_avoidance_actions=int(self.declare_parameter("max_avoidance_actions", 24).value),
             reverse_heading_threshold_deg=float(
                 self.declare_parameter("reverse_heading_threshold_deg", 135.0).value
             ),
@@ -282,6 +320,9 @@ class RobotManager(Node):
             self.declare_parameter("home_strafe_slow_radius_cm", 30.0).value
         )
         self.home_strafe_gain = float(self.declare_parameter("home_strafe_gain", 0.6).value)
+        self.map_setpoint_tolerance_cm = float(
+            self.declare_parameter("map_setpoint_tolerance_cm", self.home_tolerance_cm).value
+        )
         self.audit_shelf_ids = {
             (1, 1): str(self.declare_parameter("audit_side_1_level_1_shelf_id", "beans_can").value),
             (1, 2): str(self.declare_parameter("audit_side_1_level_2_shelf_id", "indomie").value),
@@ -309,6 +350,50 @@ class RobotManager(Node):
         self.create_timer(0.05, self._manual_safety_tick, callback_group=self.callback_group)
         self.get_logger().info("Robot manager ready")
 
+    def _configure_store_map_from_params(self) -> None:
+        AudixStoreMap.WIDTH_CM = float(self.declare_parameter("map_width_cm", AudixStoreMap.WIDTH_CM).value)
+        AudixStoreMap.HEIGHT_CM = float(self.declare_parameter("map_height_cm", AudixStoreMap.HEIGHT_CM).value)
+        AudixStoreMap.ROBOT_WIDTH_CM = float(
+            self.declare_parameter("map_robot_width_cm", AudixStoreMap.ROBOT_WIDTH_CM).value
+        )
+        AudixStoreMap.ROBOT_LENGTH_CM = float(
+            self.declare_parameter("map_robot_length_cm", AudixStoreMap.ROBOT_LENGTH_CM).value
+        )
+        AudixStoreMap.SPAWN = MapPoint(
+            float(self.declare_parameter("map_spawn_x_cm", AudixStoreMap.SPAWN.x_cm).value),
+            float(self.declare_parameter("map_spawn_y_cm", AudixStoreMap.SPAWN.y_cm).value),
+        )
+        AudixStoreMap.TOP_TRAVEL_Y_CM = float(
+            self.declare_parameter("map_top_travel_y_cm", AudixStoreMap.TOP_TRAVEL_Y_CM).value
+        )
+        AudixStoreMap.AUDIT_Y_CM = float(
+            self.declare_parameter("map_audit_y_cm", AudixStoreMap.AUDIT_Y_CM).value
+        )
+        AudixStoreMap.LANE_CENTER_X_CM = {
+            1: float(self.declare_parameter("map_lane_1_x_cm", AudixStoreMap.LANE_CENTER_X_CM[1]).value),
+            2: float(self.declare_parameter("map_lane_2_x_cm", AudixStoreMap.LANE_CENTER_X_CM[2]).value),
+        }
+        AudixStoreMap.SCAN_HEADING_DEG = {
+            1: float(self.declare_parameter("map_scan_heading_1_deg", AudixStoreMap.SCAN_HEADING_DEG[1]).value),
+            2: float(self.declare_parameter("map_scan_heading_2_deg", AudixStoreMap.SCAN_HEADING_DEG[2]).value),
+        }
+        AudixStoreMap.FRONT_AVOIDANCE_BIAS = {
+            1: int(self.declare_parameter("map_front_avoidance_bias_1", AudixStoreMap.FRONT_AVOIDANCE_BIAS[1]).value),
+            2: int(self.declare_parameter("map_front_avoidance_bias_2", AudixStoreMap.FRONT_AVOIDANCE_BIAS[2]).value),
+        }
+        AudixStoreMap.SHELF_X_MIN_CM = float(
+            self.declare_parameter("map_shelf_x_min_cm", AudixStoreMap.SHELF_X_MIN_CM).value
+        )
+        AudixStoreMap.SHELF_X_MAX_CM = float(
+            self.declare_parameter("map_shelf_x_max_cm", AudixStoreMap.SHELF_X_MAX_CM).value
+        )
+        AudixStoreMap.SHELF_Y_MIN_CM = float(
+            self.declare_parameter("map_shelf_y_min_cm", AudixStoreMap.SHELF_Y_MIN_CM).value
+        )
+        AudixStoreMap.SHELF_Y_MAX_CM = float(
+            self.declare_parameter("map_shelf_y_max_cm", AudixStoreMap.SHELF_Y_MAX_CM).value
+        )
+
     def _on_ir(self, msg: IrState) -> None:
         self.latest_ir = {
             "front_left": bool(msg.front_left),
@@ -335,6 +420,20 @@ class RobotManager(Node):
     def _active_ir(self, sensors: set[str] | None = None) -> list[str]:
         names = sensors if sensors is not None else set(IR_SENSOR_ORDER)
         return sorted(name for name in names if self.latest_ir.get(name, False))
+
+    @staticmethod
+    def _manual_watch_sensors_for_direction(direction: str) -> set[str]:
+        direction = direction.upper()
+        watch: set[str] = set()
+        if "F" in direction:
+            watch.update(FRONT_WATCH_SENSORS)
+        if "B" in direction:
+            watch.add("back")
+        if "L" in direction:
+            watch.update({"left", "front_left"})
+        if "R" in direction:
+            watch.update({"right", "front_right"})
+        return watch
 
     def _call_sync(self, client, request, timeout_s: float):
         if not client.wait_for_service(timeout_sec=max(0.1, float(timeout_s))):
@@ -370,9 +469,8 @@ class RobotManager(Node):
         now = time.monotonic()
         if active:
             if now - self.manual_stop_last_s >= 0.5:
-                self._stop_robot()
                 self.manual_stop_last_s = now
-                self._publish_event(f"manual obstacle stop: {active}")
+                self._publish_event(f"manual obstacle active: {active}")
             self.manual_buzzer_until = now + self.buzzer_hold_s
             self._set_buzzer(True)
         elif self.manual_buzzer_until and now >= self.manual_buzzer_until:
@@ -507,24 +605,70 @@ class RobotManager(Node):
         still_front = any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS)
         return still_front, ir_state
 
+    def _current_map_estimate(self) -> MapPoint:
+        if self.latest_telemetry is None:
+            return self.map_pose
+        return MapPoint(
+            AudixStoreMap.SPAWN.x_cm - float(self.pose.world_strafe_cm),
+            AudixStoreMap.SPAWN.y_cm - float(self.pose.world_forward_cm),
+        )
+
+    @staticmethod
+    def _shelf_center() -> MapPoint:
+        return MapPoint(
+            0.5 * (AudixStoreMap.SHELF_X_MIN_CM + AudixStoreMap.SHELF_X_MAX_CM),
+            0.5 * (AudixStoreMap.SHELF_Y_MIN_CM + AudixStoreMap.SHELF_Y_MAX_CM),
+        )
+
     def _active_avoidance_side(self) -> int:
         if self.current_audit_side in AudixStoreMap.LANE_CENTER_X_CM:
             return int(self.current_audit_side)
+        current = self._current_map_estimate()
         return min(
             AudixStoreMap.LANE_CENTER_X_CM,
-            key=lambda side: abs(AudixStoreMap.LANE_CENTER_X_CM[side] - self.map_pose.x_cm),
+            key=lambda side: abs(AudixStoreMap.LANE_CENTER_X_CM[side] - current.x_cm),
         )
 
     def _heading_is_reversed(self) -> bool:
         threshold = min(179.0, max(90.0, float(self.args.reverse_heading_threshold_deg)))
         return abs(wrap_degrees(self.args.heading)) >= threshold
 
-    def _front_avoidance_bias(self) -> tuple[int, int]:
+    @staticmethod
+    def _heading_is_near(heading_deg: float, target_deg: float, tolerance_deg: float = 45.0) -> bool:
+        return abs(wrap_degrees(float(heading_deg) - float(target_deg))) <= float(tolerance_deg)
+
+    def _shelf_aware_bias_for_heading(self, heading_deg: float, side: int) -> tuple[int, str]:
+        current = self._current_map_estimate()
+        shelf = self._shelf_center()
+        heading = wrap_degrees(heading_deg)
+
+        if self._heading_is_near(heading, HEADING_RIGHT_DEG):
+            home_side = current.y_cm >= shelf.y_cm
+            bias = LEFT if home_side else RIGHT
+            side_label = "home side" if home_side else "far side"
+            return bias, f"shelf-aware {side_label}, facing right"
+
+        if self._heading_is_near(heading, HEADING_LEFT_DEG):
+            home_side = current.y_cm >= shelf.y_cm
+            bias = RIGHT if home_side else LEFT
+            side_label = "home side" if home_side else "far side"
+            return bias, f"shelf-aware {side_label}, facing left"
+
+        if current.x_cm < shelf.x_cm:
+            return RIGHT, "shelf-aware lane side toward shelf"
+        if current.x_cm > shelf.x_cm:
+            return LEFT, "shelf-aware lane side toward shelf"
+
+        bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
+        return bias, f"shelf-aware center fallback lane{side}"
+
+    def _front_avoidance_bias(self) -> tuple[int, int, str]:
         side = self._active_avoidance_side()
         if self.front_avoidance_bias_override is not None:
-            return side, self.front_avoidance_bias_override
-        bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
-        return side, bias
+            reason = self.front_avoidance_bias_override_reason or "explicit travel override"
+            return side, self.front_avoidance_bias_override, reason
+        bias, reason = self._shelf_aware_bias_for_heading(self.args.heading, side)
+        return side, bias, reason
 
     def _map_direction_to_body_direction(self, direction: str) -> str:
         direction = direction.upper()
@@ -538,14 +682,10 @@ class RobotManager(Node):
         }.get(direction, direction)
 
     def _map_lateral_to_body_direction(self, direction: int) -> int:
-        if not self._heading_is_reversed():
-            return direction
-        return opposite_direction(direction)
+        return direction
 
     def _body_lateral_to_map_direction(self, direction: int) -> int:
-        if not self._heading_is_reversed():
-            return direction
-        return opposite_direction(direction)
+        return direction
 
     def _avoidance_direction_label(self, direction: int) -> str:
         body_direction = self._map_lateral_to_body_direction(direction)
@@ -555,7 +695,7 @@ class RobotManager(Node):
         return label
 
     def _choose_front_avoidance(self, ir_state: dict[str, bool]) -> tuple[int, str]:
-        side, bias = self._front_avoidance_bias()
+        side, bias, bias_reason = self._front_avoidance_bias()
         front = bool(ir_state.get("front", False))
         front_left = bool(ir_state.get("front_left", False))
         front_right = bool(ir_state.get("front_right", False))
@@ -564,12 +704,12 @@ class RobotManager(Node):
                 return self._body_lateral_to_map_direction(RIGHT), "front+front_left"
             if front_right and not front_left:
                 return self._body_lateral_to_map_direction(LEFT), "front+front_right"
-            return bias, f"front lane{side} bias {direction_name(bias)}"
+            return bias, f"front lane{side} {bias_reason} bias {direction_name(bias)}"
         if front_left:
             return self._body_lateral_to_map_direction(RIGHT), "front_left"
         if front_right:
             return self._body_lateral_to_map_direction(LEFT), "front_right"
-        return bias, f"front lane{side} bias {direction_name(bias)}"
+        return bias, f"front lane{side} {bias_reason} bias {direction_name(bias)}"
 
     def _execute_front_search_strafe(self, direction: int, mission: MissionMemory) -> tuple[dict, int, str]:
         for _attempt in range(2):
@@ -609,18 +749,9 @@ class RobotManager(Node):
             return None
 
         body_direction = self._map_lateral_to_body_direction(direction)
-        strafe_distance = max(
-            0.0,
-            self.args.front_strafe_search_distance - self.args.front_corner_clear_trim_distance,
-        )
-        self._publish_event(
-            "corner clear strafe budget "
-            f"{strafe_distance * 100.0:.1f}cm "
-            f"(trim {self.args.front_corner_clear_trim_distance * 100.0:.1f}cm)"
-        )
         done = self._execute_move_watch(
             direction_to_angle(body_direction),
-            strafe_distance,
+            self.args.front_strafe_search_distance,
             set(),
             self.args.front_strafe_search_timeout,
             label=f"strafe {self._avoidance_direction_label(direction)} until {corner_sensor} falling",
@@ -947,8 +1078,6 @@ class RobotManager(Node):
             last_done = done
             if result not in MAP_MOVE_OK_RESULTS:
                 return done
-            if result == "completed":
-                break
 
             mission.sync_from_pose(self.pose)
             remaining_m = max(0.0, distance_m - mission.forward_m)
@@ -975,6 +1104,18 @@ class RobotManager(Node):
                 f"world move heading {self.args.heading:.1f}deg converts {direction} to body {body_direction}"
             )
         return self._mission_direction_move(body_direction, distance_cm, timeout_s)
+
+    def _execute_world_forward_as_forward(self, direction: str, distance_cm: float, *, label: str) -> dict:
+        direction = direction.upper()
+        if direction not in {"F", "B"}:
+            raise RuntimeError(f"world forward-axis move requires F/B, got {direction}")
+        target_heading = forward_heading_for_world_direction(direction)
+        distance_cm = abs(float(distance_cm))
+        self._publish_event(
+            f"{label}: face {target_heading:.0f}deg, forward {distance_cm:.1f}cm"
+        )
+        self._execute_rotation_to_heading(target_heading, f"{label} face world {direction}")
+        return self._mission_direction_move("F", distance_cm, 0.0)
 
     def _world_direction_to_body_direction(self, direction: str) -> str:
         direction = direction.upper()
@@ -1058,19 +1199,24 @@ class RobotManager(Node):
         label: str,
         bias_note: str,
     ) -> dict:
-        heading_deg, bias = self._lateral_forward_heading_and_bias(direction)
+        heading_deg, _default_bias = self._lateral_forward_heading_and_bias(direction)
+        side = self._active_avoidance_side()
+        bias, bias_reason = self._shelf_aware_bias_for_heading(heading_deg, side)
         distance_cm = abs(float(distance_cm))
         self._publish_event(
             f"{label}: face {heading_deg:.0f}deg, forward {distance_cm:.1f}cm; "
-            f"front avoidance bias {direction_name(bias)} {bias_note}"
+            f"front avoidance bias {direction_name(bias)} {bias_note}; {bias_reason}"
         )
         previous_bias = self.front_avoidance_bias_override
+        previous_bias_reason = self.front_avoidance_bias_override_reason
         self.front_avoidance_bias_override = bias
+        self.front_avoidance_bias_override_reason = bias_reason
         try:
             self._execute_rotation_to_heading(heading_deg, f"{label} face lateral travel")
             return self._mission_direction_move("F", distance_cm, 0.0)
         finally:
             self.front_avoidance_bias_override = previous_bias
+            self.front_avoidance_bias_override_reason = previous_bias_reason
 
     def _reset_map_pose(self) -> None:
         self.map_pose = AudixStoreMap.SPAWN
@@ -1082,6 +1228,85 @@ class RobotManager(Node):
         if self.cancel_mission.is_set():
             raise RuntimeError("mission cancelled")
 
+    @staticmethod
+    def _map_target_world_cm(target: MapPoint) -> tuple[float, float]:
+        forward_cm = -(target.y_cm - AudixStoreMap.SPAWN.y_cm)
+        strafe_cm = -(target.x_cm - AudixStoreMap.SPAWN.x_cm)
+        return forward_cm, strafe_cm
+
+    def _map_setpoint_error_cm(self, target: MapPoint) -> tuple[float, float, float, float]:
+        self._wait_for_telemetry(timeout_s=1.0)
+        target_forward_cm, target_strafe_cm = self._map_target_world_cm(target)
+        current_forward_cm = float(self.pose.world_forward_cm)
+        current_strafe_cm = float(self.pose.world_strafe_cm)
+        return (
+            target_forward_cm - current_forward_cm,
+            target_strafe_cm - current_strafe_cm,
+            current_forward_cm,
+            current_strafe_cm,
+        )
+
+    def _finish_map_target(self, target: MapPoint, label: str) -> dict:
+        tolerance_cm = max(0.5, float(self.map_setpoint_tolerance_cm))
+        max_attempts = max(1, int(self.args.max_goal_correction_attempts))
+        last_done = MoveDone(heading_deg=self._current_heading_deg()).as_dict()
+
+        for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled()
+            forward_error_cm, strafe_error_cm, current_forward_cm, current_strafe_cm = (
+                self._map_setpoint_error_cm(target)
+            )
+            if abs(forward_error_cm) <= tolerance_cm and abs(strafe_error_cm) <= tolerance_cm:
+                self._publish_event(
+                    f"setpoint reached {label}: "
+                    f"world forward={current_forward_cm:.1f}cm strafe={current_strafe_cm:.1f}cm"
+                )
+                return MoveDone(
+                    result=MAP_SETPOINT_REACHED_RESULT,
+                    forward_cm=current_forward_cm,
+                    strafe_cm=current_strafe_cm,
+                    heading_deg=self._current_heading_deg(),
+                ).as_dict()
+
+            if abs(forward_error_cm) >= abs(strafe_error_cm):
+                direction = "F" if forward_error_cm > 0.0 else "B"
+                distance_cm = abs(forward_error_cm)
+                self._publish_event(
+                    f"setpoint correction {label} pass {attempt}: "
+                    f"world {direction} {distance_cm:.1f}cm"
+                )
+                last_done = self._execute_world_forward_as_forward(
+                    direction,
+                    distance_cm,
+                    label=f"setpoint correction {label}",
+                )
+            else:
+                direction = "L" if strafe_error_cm > 0.0 else "R"
+                distance_cm = abs(strafe_error_cm)
+                self._publish_event(
+                    f"setpoint correction {label} pass {attempt}: "
+                    f"world {direction} {distance_cm:.1f}cm"
+                )
+                last_done = self._execute_lateral_as_forward(
+                    direction,
+                    distance_cm,
+                    label=f"setpoint correction {label}",
+                    bias_note="toward commanded map setpoint",
+                )
+
+            result = str(last_done.get("result", ""))
+            if result not in MAP_MOVE_OK_RESULTS:
+                raise RuntimeError(
+                    f"setpoint correction {label} failed: {result or last_done.get('message', 'unknown')}"
+                )
+
+        forward_error_cm, strafe_error_cm, current_forward_cm, current_strafe_cm = self._map_setpoint_error_cm(target)
+        raise RuntimeError(
+            f"setpoint {label} not reached: "
+            f"error forward={forward_error_cm:.1f}cm strafe={strafe_error_cm:.1f}cm "
+            f"current forward={current_forward_cm:.1f}cm strafe={current_strafe_cm:.1f}cm"
+        )
+
     def _execute_mapped_move(self, direction: str, distance_cm: float, target: MapPoint, label: str) -> None:
         self._raise_if_cancelled()
         distance_cm = abs(float(distance_cm))
@@ -1092,10 +1317,18 @@ class RobotManager(Node):
         self._publish_event(
             f"map move {label}: {direction} {distance_cm:.1f}cm -> x={target.x_cm:.1f} y={target.y_cm:.1f}"
         )
-        done = self._mission_world_direction_move(direction, distance_cm, 0.0)
+        if direction in {"F", "B"}:
+            done = self._execute_world_forward_as_forward(
+                direction,
+                distance_cm,
+                label=f"map move {label}",
+            )
+        else:
+            done = self._mission_world_direction_move(direction, distance_cm, 0.0)
         result = str(done.get("result", ""))
         if result not in MAP_MOVE_OK_RESULTS:
             raise RuntimeError(f"map move {label} failed: {result or done.get('message', 'unknown')}")
+        self._finish_map_target(target, label)
         self.map_pose = target
 
     def _move_map_x(self, target_x_cm: float, label: str) -> None:
@@ -1122,6 +1355,7 @@ class RobotManager(Node):
         result = str(done.get("result", ""))
         if result not in MAP_MOVE_OK_RESULTS:
             raise RuntimeError(f"map lane shift {label} failed: {result or done.get('message', 'unknown')}")
+        self._finish_map_target(target, label)
         self.map_pose = target
 
     def _move_map_y(self, target_y_cm: float, label: str) -> None:
@@ -1357,20 +1591,21 @@ class RobotManager(Node):
                 with self.mode_lock:
                     mode = self.mode
                 if mode == "manual":
-                    active = self._active_ir()
+                    watch_sensors = self._manual_watch_sensors_for_direction(direction)
+                    active = self._active_ir(watch_sensors)
                     if active:
                         self._stop_robot()
                         self._set_buzzer(True)
                         self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
                         response.ok = False
                         response.result = "manual_ir_stop"
-                        response.message = f"manual obstacle stop: {active}"
+                        response.message = f"manual {direction} blocked by IR: {active}"
                         return response
                     angle = DIRECTION_ANGLES_DEG[direction]
                     done = self._execute_segment(
                         angle,
                         max(0.0, float(request.distance_cm)) / 100.0,
-                        set(),
+                        watch_sensors,
                         None,
                         label=f"manual {direction}",
                         move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
@@ -1389,7 +1624,7 @@ class RobotManager(Node):
                 response.heading_deg = self._current_heading_deg()
                 return response
 
-        response.ok = done.get("result") in {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "none"}
+        response.ok = done.get("result") in MAP_MOVE_OK_RESULTS
         response.result = str(done.get("result", ""))
         response.message = str(done.get("message", response.result))
         response.forward_cm = float(done.get("forwardCm", 0.0))
@@ -1409,16 +1644,6 @@ class RobotManager(Node):
 
         with self.motion_lock:
             try:
-                active = self._active_ir() if self.mode == "manual" else []
-                if active:
-                    self._stop_robot()
-                    self._set_buzzer(True)
-                    self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
-                    response.ok = False
-                    response.result = "manual_ir_stop"
-                    response.message = f"manual obstacle stop: {active}"
-                    response.heading_deg = self._current_heading_deg()
-                    return response
                 self._publish_event(f"rotate {direction} {request.degrees:.1f}deg target={target:.1f}")
                 future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
                 result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
@@ -1659,9 +1884,9 @@ class RobotManager(Node):
         self._stop_robot()
         self._set_buzzer(False)
         with self.mode_lock:
-            self.mode = "manual"
+            self.mode = self.stop_mode
         response.success = True
-        response.message = "robot stopped and manager set to manual"
+        response.message = f"robot stopped and manager set to {self.stop_mode}"
         self._publish_event(response.message)
         return response
 

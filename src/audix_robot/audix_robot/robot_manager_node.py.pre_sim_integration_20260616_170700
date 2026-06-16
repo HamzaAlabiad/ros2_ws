@@ -108,7 +108,6 @@ class MissionArgs:
     front_corner_strafe_distance: float = 0.15
     front_advance_distance: float = 0.20
     front_strafe_search_distance: float = 1.20
-    front_corner_clear_trim_distance: float = 0.02
     front_corner_buffer_distance: float = 0.05
     front_strafe_search_timeout: float = 8.0
     front_corner_buffer_timeout: float = 1.25
@@ -179,52 +178,28 @@ class PoseAccumulator:
 class MissionMemory:
     forward_m: float = 0.0
     lateral_m: float = 0.0
-    path_origin_forward_m: float = 0.0
-    path_origin_strafe_m: float = 0.0
-    lateral_reference_forward_m: float = 0.0
-    lateral_reference_strafe_m: float = 0.0
-    path_heading_deg: float = 0.0
+    lateral_reference_m: float = 0.0
 
-    def reset_path_reference(self, pose_tracker: PoseAccumulator, path_heading_deg: float) -> None:
-        self.path_origin_forward_m = 0.01 * float(pose_tracker.world_forward_cm)
-        self.path_origin_strafe_m = 0.01 * float(pose_tracker.world_strafe_cm)
-        self.lateral_reference_forward_m = self.path_origin_forward_m
-        self.lateral_reference_strafe_m = self.path_origin_strafe_m
-        self.path_heading_deg = wrap_degrees(path_heading_deg)
-        self.forward_m = 0.0
-        self.lateral_m = 0.0
+    def record_completed_move(self, angle_deg: float, distance_m: float, done: dict) -> None:
+        if done.get("result") == "ir_stop":
+            return
+        angle_rad = math.radians(angle_deg)
+        command_forward_m = math.cos(angle_rad) * distance_m
+        command_lateral_m = math.sin(angle_rad) * distance_m
+        if abs(command_forward_m) >= abs(command_lateral_m):
+            reported_forward_m = 0.01 * float(done.get("forwardCm", command_forward_m * 100.0))
+            if abs(reported_forward_m) < 1e-6:
+                reported_forward_m = command_forward_m
+            self.forward_m = max(0.0, self.forward_m + reported_forward_m)
+        else:
+            self.lateral_m += command_lateral_m
 
     def sync_from_pose(self, pose_tracker: PoseAccumulator) -> None:
-        self.sync_from_world(float(pose_tracker.world_forward_cm), float(pose_tracker.world_strafe_cm))
-
-    def sync_from_done(self, done: dict, pose_tracker: PoseAccumulator) -> None:
-        try:
-            forward_cm = float(done.get("forwardCm", pose_tracker.world_forward_cm))
-            strafe_cm = float(done.get("strafeCm", pose_tracker.world_strafe_cm))
-        except (TypeError, ValueError):
-            self.sync_from_pose(pose_tracker)
-            return
-        self.sync_from_world(forward_cm, strafe_cm)
-
-    def sync_from_world(self, forward_cm: float, strafe_cm: float) -> None:
-        current_forward_m = 0.01 * float(forward_cm)
-        current_strafe_m = 0.01 * float(strafe_cm)
-        path_delta_forward_m = current_forward_m - self.path_origin_forward_m
-        path_delta_strafe_m = current_strafe_m - self.path_origin_strafe_m
-        lateral_delta_forward_m = current_forward_m - self.lateral_reference_forward_m
-        lateral_delta_strafe_m = current_strafe_m - self.lateral_reference_strafe_m
-        yaw_rad = math.radians(self.path_heading_deg)
-        forward_axis = (math.cos(yaw_rad), math.sin(yaw_rad))
-        left_axis = (-math.sin(yaw_rad), math.cos(yaw_rad))
-        self.forward_m = max(
-            0.0,
-            path_delta_forward_m * forward_axis[0] + path_delta_strafe_m * forward_axis[1],
-        )
-        self.lateral_m = lateral_delta_forward_m * left_axis[0] + lateral_delta_strafe_m * left_axis[1]
+        self.forward_m = max(0.0, -pose_tracker.x)
+        self.lateral_m = -pose_tracker.y - self.lateral_reference_m
 
     def reset_lateral_reference(self, pose_tracker: PoseAccumulator) -> None:
-        self.lateral_reference_forward_m = 0.01 * float(pose_tracker.world_forward_cm)
-        self.lateral_reference_strafe_m = 0.01 * float(pose_tracker.world_strafe_cm)
+        self.lateral_reference_m = -pose_tracker.y
         self.lateral_m = 0.0
 
     def snap_center_if_close(self, tolerance_m: float) -> None:
@@ -422,15 +397,6 @@ class RobotManager(Node):
         future = self._send_move_future(angle_deg, distance_m, self.args.heading, timeout_s)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            with self.mode_lock:
-                mode = self.mode
-            if mode != "manual" and self.cancel_mission.is_set():
-                self._stop_robot()
-                response = self._wait_future_response(future, 1.5)
-                if response is not None:
-                    return self._move_done_from_response(response, result_override="cancelled")
-                return MoveDone(result="cancelled", heading_deg=self._current_heading_deg()).as_dict()
-
             if future.done():
                 response = future.result()
                 return self._move_done_from_response(response)
@@ -487,8 +453,12 @@ class RobotManager(Node):
         if done.get("result") == "timeout_stop" and not timeout_returns_done:
             raise TimeoutError(f"Timed out during {label}")
         if mission is not None:
-            mission.sync_from_done(done, self.pose)
-            mission.snap_center_if_close(self.args.rejoin_tolerance)
+            if done.get("result") == "ir_stop":
+                mission.sync_from_pose(self.pose)
+            else:
+                mission.record_completed_move(angle_deg, distance_m, done)
+                mission.sync_from_pose(self.pose)
+                mission.snap_center_if_close(self.args.rejoin_tolerance)
         return done
 
     def _wait_for_dynamic_front_clear(self, active_sensors: list[str]) -> tuple[bool, dict[str, bool]]:
@@ -496,11 +466,7 @@ class RobotManager(Node):
         self._publish_event(f"dynamic front hold {hold_s:.1f}s active={active_sensors}")
         self._set_buzzer(True)
         try:
-            deadline = time.monotonic() + hold_s
-            while time.monotonic() < deadline:
-                if self.cancel_mission.is_set():
-                    break
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            time.sleep(hold_s)
         finally:
             self._set_buzzer(False)
         ir_state = dict(self.latest_ir)
@@ -609,18 +575,9 @@ class RobotManager(Node):
             return None
 
         body_direction = self._map_lateral_to_body_direction(direction)
-        strafe_distance = max(
-            0.0,
-            self.args.front_strafe_search_distance - self.args.front_corner_clear_trim_distance,
-        )
-        self._publish_event(
-            "corner clear strafe budget "
-            f"{strafe_distance * 100.0:.1f}cm "
-            f"(trim {self.args.front_corner_clear_trim_distance * 100.0:.1f}cm)"
-        )
         done = self._execute_move_watch(
             direction_to_angle(body_direction),
-            strafe_distance,
+            self.args.front_strafe_search_distance,
             set(),
             self.args.front_strafe_search_timeout,
             label=f"strafe {self._avoidance_direction_label(direction)} until {corner_sensor} falling",
@@ -690,9 +647,9 @@ class RobotManager(Node):
     def _side_path_direction(self, active_sensors: list[str]) -> int:
         active = set(active_sensors)
         if "right" in active and "left" not in active:
-            return self._body_lateral_to_map_direction(LEFT)
-        if "left" in active and "right" not in active:
             return self._body_lateral_to_map_direction(RIGHT)
+        if "left" in active and "right" not in active:
+            return self._body_lateral_to_map_direction(LEFT)
         return self._front_avoidance_bias()[1]
 
     def _execute_side_path_escape(self, active_sensors: list[str], action_budget: list[int], mission: MissionMemory) -> dict:
@@ -740,7 +697,7 @@ class RobotManager(Node):
             if abs(offset) <= self.args.rejoin_tolerance:
                 mission.lateral_m = 0.0
                 return last_done
-            direction = RIGHT if offset > 0.0 else LEFT
+            direction = LEFT if offset > 0.0 else RIGHT
             body_direction = self._map_lateral_to_body_direction(direction)
             done = self._execute_segment(
                 direction_to_angle(body_direction),
@@ -763,18 +720,6 @@ class RobotManager(Node):
     ) -> dict:
         done = self._execute_strafe_until_corner_falling(direction, corner_sensor, mission)
         if done.get("result") == "ir_stop":
-            body_direction = self._map_lateral_to_body_direction(direction)
-            side_block_sensor = side_sensor_for_direction(body_direction)
-            if side_block_sensor in set(done.get("ir", [])):
-                direction = opposite_direction(direction)
-                self._publish_event(
-                    "front avoidance side blocked: "
-                    f"switch strafe to {self._avoidance_direction_label(direction)}"
-                )
-                done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
-                if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
-                    return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-                return self._finish_front_avoidance_after_corner(direction, corner_sensor, action_budget, mission)
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
         body_direction = self._map_lateral_to_body_direction(direction)
         side_sensor = side_sensor_after_front_avoidance(body_direction)
@@ -793,20 +738,6 @@ class RobotManager(Node):
         if done.get("result") == "ir_stop":
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
         return self._execute_recenter(action_budget, mission)
-
-    def _finish_front_clear(self, ir_state: dict[str, bool], action_budget: list[int], mission: MissionMemory) -> dict:
-        side_hits = sorted(name for name in SIDE_WATCH_SENSORS if ir_state.get(name, False))
-        if side_hits:
-            done = self._execute_side_path_escape(side_hits, action_budget, mission)
-            if done.get("result") == "ir_stop":
-                return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-            if abs(mission.lateral_m) > self.args.rejoin_tolerance:
-                return self._execute_recenter(action_budget, mission)
-            return done
-        if abs(mission.lateral_m) > self.args.rejoin_tolerance:
-            self._publish_event("front clear after avoidance: return to center")
-            return self._execute_recenter(action_budget, mission)
-        return MoveDone(result="front_dynamic_clear", heading_deg=self._current_heading_deg()).as_dict()
 
     def _execute_front_corner_avoidance(
         self,
@@ -871,13 +802,14 @@ class RobotManager(Node):
             still_front, ir_state = self._wait_for_dynamic_front_clear(
                 sorted(name for name in FRONT_WATCH_SENSORS if ir_state.get(name, False))
             )
-            if self.cancel_mission.is_set():
-                return MoveDone(result="cancelled", heading_deg=self._current_heading_deg()).as_dict()
             if not still_front:
-                if not any(ir_state.get(name, False) for name in ALL_WATCH_SENSORS):
-                    self._publish_event("dynamic front clear: resume interrupted move")
-                    return MoveDone(result="front_dynamic_clear", heading_deg=self._current_heading_deg()).as_dict()
-                return self._finish_front_clear(ir_state, action_budget, mission)
+                side_hits = sorted(name for name in SIDE_WATCH_SENSORS if ir_state.get(name, False))
+                if side_hits:
+                    done = self._execute_side_path_escape(side_hits, action_budget, mission)
+                    if done.get("result") == "ir_stop":
+                        return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+                    return done
+                return MoveDone(result="front_dynamic_clear", heading_deg=self._current_heading_deg()).as_dict()
             return self._execute_front_avoidance(ir_state, action_budget, mission)
         if any(ir_state.get(name, False) for name in SIDE_WATCH_SENSORS):
             done = self._execute_side_path_escape(active_sensors, action_budget, mission)
@@ -914,58 +846,29 @@ class RobotManager(Node):
         action_budget = [self.args.max_avoidance_actions]
         move_timeout_s = timeout_s if timeout_s > 0.0 else self.args.move_timeout
         distance_m = max(0.0, distance_cm) / 100.0
-
         if direction == "B":
-            self._publish_event("mission B: face heading 180 then move forward")
-            self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, "mission B turn around")
-            primary_angle = HEADING_FORWARD_DEG
-            primary_label = "mission B forward"
-        else:
-            primary_angle = DIRECTION_ANGLES_DEG[direction]
-            primary_label = f"mission {direction}"
-
-        path_heading = wrap_degrees(self.args.heading + primary_angle)
-        mission.reset_path_reference(self.pose, path_heading)
-        remaining_m = distance_m
-        last_done = MoveDone(heading_deg=self._current_heading_deg()).as_dict()
-
-        while remaining_m > self.args.min_position_step:
-            self._raise_if_cancelled()
-            done = self._execute_segment(
-                primary_angle,
-                remaining_m,
+            done = self._execute_turnaround_forward(
+                distance_m,
                 ALL_WATCH_SENSORS,
                 mission,
-                label=primary_label,
+                label="mission B",
                 move_timeout_s=move_timeout_s,
                 timeout_returns_done=True,
             )
-            if done.get("result") == "ir_stop":
-                done = self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-
-            result = str(done.get("result", ""))
-            last_done = done
-            if result not in MAP_MOVE_OK_RESULTS:
-                return done
-            if result == "completed":
-                break
-
-            mission.sync_from_pose(self.pose)
-            remaining_m = max(0.0, distance_m - mission.forward_m)
-            if remaining_m <= self.args.min_position_step:
-                break
-
-            self._publish_event(
-                f"{primary_label}: resume remaining {remaining_m * 100.0:.1f}cm after {result}"
+        else:
+            angle = DIRECTION_ANGLES_DEG[direction]
+            done = self._execute_segment(
+                angle,
+                distance_m,
+                ALL_WATCH_SENSORS,
+                mission,
+                label=f"mission {direction}",
+                move_timeout_s=move_timeout_s,
+                timeout_returns_done=True,
             )
-
-        return MoveDone(
-            result="completed",
-            message=str(last_done.get("message", "completed")),
-            forward_cm=float(self.pose.world_forward_cm),
-            strafe_cm=float(self.pose.world_strafe_cm),
-            heading_deg=self._current_heading_deg(),
-        ).as_dict()
+        if done.get("result") == "ir_stop":
+            done = self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        return done
 
     def _mission_world_direction_move(self, direction: str, distance_cm: float, timeout_s: float) -> dict:
         direction = direction.upper()
@@ -1330,9 +1233,7 @@ class RobotManager(Node):
             return response
         with self.mode_lock:
             self.mode = mode
-        if mode == "mission":
-            self.cancel_mission.clear()
-        else:
+        if mode != "mission":
             self.cancel_mission.set()
         response.ok = True
         response.message = f"mode set to {mode}"

@@ -42,10 +42,6 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "frame_id": "odom",
-                        "base_frame_id": "base_footprint",
-                        "publish_odom": True,
-                        "publish_tf": True,
                         "init_imu_on_start": ParameterValue(init_imu_on_start, value_type=bool),
                         "reset_odom_on_start": ParameterValue(reset_odom_on_start, value_type=bool),
                     }
