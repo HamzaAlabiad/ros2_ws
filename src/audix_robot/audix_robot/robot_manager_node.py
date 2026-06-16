@@ -65,7 +65,7 @@ class AudixStoreMap:
     AUDIT_Y_CM = 80.0
     LANE_CENTER_X_CM = {1: 50.0, 2: 200.0}
     SIDE_NAME = {1: "left shelf side", 2: "right shelf side"}
-    SCAN_HEADING_DEG = {1: HEADING_LEFT_DEG, 2: HEADING_RIGHT_DEG}
+    SCAN_HEADING_DEG = {1: HEADING_RIGHT_DEG, 2: HEADING_LEFT_DEG}
     FRONT_AVOIDANCE_BIAS = {1: LEFT, 2: RIGHT}
     SHELF_X_MIN_CM = 105.0
     SHELF_X_MAX_CM = 145.0
@@ -241,8 +241,22 @@ class RobotManager(Node):
         self.scan_timeout_s = float(self.declare_parameter("vision_scan_timeout_s", 25.0).value)
         self.scan_settle_s = float(self.declare_parameter("vision_scan_settle_s", 0.5).value)
         self.home_tolerance_cm = float(self.declare_parameter("home_tolerance_cm", 2.0).value)
-        self.home_max_passes = int(self.declare_parameter("home_max_passes", 8).value)
+        self.home_max_passes = int(self.declare_parameter("home_max_passes", 12).value)
         self.home_settle_s = float(self.declare_parameter("home_settle_s", 0.25).value)
+        self.home_axis_slow_radius_cm = float(
+            self.declare_parameter("home_axis_slow_radius_cm", 30.0).value
+        )
+        self.home_axis_gain = float(self.declare_parameter("home_axis_gain", 0.6).value)
+        self.home_max_axis_corrections = int(
+            self.declare_parameter("home_max_axis_corrections", 4).value
+        )
+        self.home_direct_correction_radius_cm = float(
+            self.declare_parameter("home_direct_correction_radius_cm", 12.0).value
+        )
+        self.home_strafe_slow_radius_cm = float(
+            self.declare_parameter("home_strafe_slow_radius_cm", 30.0).value
+        )
+        self.home_strafe_gain = float(self.declare_parameter("home_strafe_gain", 0.6).value)
         self.audit_shelf_ids = {
             (1, 1): str(self.declare_parameter("audit_side_1_level_1_shelf_id", "beans_can").value),
             (1, 2): str(self.declare_parameter("audit_side_1_level_2_shelf_id", "indomie").value),
@@ -865,6 +879,43 @@ class RobotManager(Node):
             )
         return self._mission_direction_move(body_direction, distance_cm, timeout_s)
 
+    def _world_direction_to_body_direction(self, direction: str) -> str:
+        direction = direction.upper()
+        world_angle = DIRECTION_ANGLES_DEG[direction]
+        body_angle = wrap_degrees(world_angle - self.args.heading)
+        cardinal = ("F", "R", "B", "L")
+        return min(
+            cardinal,
+            key=lambda key: abs(wrap_degrees(DIRECTION_ANGLES_DEG[key] - body_angle)),
+        )
+
+    def _home_world_direction_move(self, direction: str, distance_cm: float, label: str) -> dict:
+        direction = direction.upper()
+        distance_cm = abs(float(distance_cm))
+        if distance_cm <= max(0.0, float(self.home_direct_correction_radius_cm)):
+            body_direction = self._world_direction_to_body_direction(direction)
+            if body_direction != direction:
+                self._publish_event(
+                    f"home direct heading {self.args.heading:.1f}deg converts "
+                    f"{direction} to body {body_direction}"
+                )
+            angle_deg = DIRECTION_ANGLES_DEG[body_direction]
+            timeout_s = max(4.0, distance_cm / 4.0 + 2.0)
+            self._publish_event(
+                f"{label}: direct body {body_direction} {distance_cm:.1f}cm "
+                f"without heading change"
+            )
+            return self._execute_segment(
+                angle_deg,
+                distance_cm / 100.0,
+                ALL_WATCH_SENSORS | {"back"},
+                MissionMemory(),
+                label=f"{label} direct",
+                move_timeout_s=timeout_s,
+                timeout_returns_done=True,
+            )
+        return self._mission_world_direction_move(direction, distance_cm, 0.0)
+
     @staticmethod
     def _lateral_forward_heading_and_bias(direction: str) -> tuple[float, int]:
         direction = direction.upper()
@@ -968,7 +1019,8 @@ class RobotManager(Node):
         self._publish_event(
             f"target {side_name}: lane_x={lane_x:.1f} audit_y={AudixStoreMap.AUDIT_Y_CM:.1f}"
         )
-        self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} lane travel face forward")
+        if abs(AudixStoreMap.TOP_TRAVEL_Y_CM - self.map_pose.y_cm) > 0.25:
+            self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} lane travel face forward")
         self._move_map_y(AudixStoreMap.TOP_TRAVEL_Y_CM, "top clear corridor")
         self._move_map_x(lane_x, f"{side_name} lane center")
         self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} audit row face forward")
@@ -1092,6 +1144,17 @@ class RobotManager(Node):
             finally:
                 self._run_lift(self.lift_steps, -1)
 
+    def _return_to_lane_start_after_scan(self, side: int) -> None:
+        side_name = AudixStoreMap.SIDE_NAME[side]
+        self._execute_rotation_to_heading(
+            HEADING_BACKWARD_DEG,
+            f"{side_name} scan complete face lane start",
+        )
+        self._move_map_y(
+            AudixStoreMap.TOP_TRAVEL_Y_CM,
+            f"{side_name} return to lane start",
+        )
+
     def _run_map_audit(self, sides: list[int], levels: list[int]) -> None:
         try:
             with self.mode_lock:
@@ -1104,9 +1167,8 @@ class RobotManager(Node):
                 f"sides={sides} levels={levels}"
             )
 
-            for index, side in enumerate(sides):
+            for side in sides:
                 self._raise_if_cancelled()
-                final_side = index == len(sides) - 1
                 self._go_to_audit_side(side)
                 scan_heading = AudixStoreMap.SCAN_HEADING_DEG[side]
                 self._execute_rotation_to_heading(scan_heading, f"face {AudixStoreMap.SIDE_NAME[side]}")
@@ -1116,10 +1178,8 @@ class RobotManager(Node):
                     side_scans_complete = True
                 finally:
                     if not self.cancel_mission.is_set():
-                        if final_side and side_scans_complete:
-                            self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, "final scan face lane start")
-                        else:
-                            self._execute_rotation_to_heading(HEADING_FORWARD_DEG, "return forward before next lane")
+                        if side_scans_complete:
+                            self._return_to_lane_start_after_scan(side)
 
             self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, "mission complete face home")
             self._go_home_to_odom_zero("mission complete home")
@@ -1302,75 +1362,203 @@ class RobotManager(Node):
             raise RuntimeError("cannot home before telemetry is available")
         raise RuntimeError("timed out waiting for fresh odom telemetry")
 
+    @staticmethod
+    def _home_axis_step_cm(
+        error_cm: float,
+        tolerance_cm: float,
+        slow_radius_cm: float,
+        gain: float,
+    ) -> float:
+        error_cm = abs(float(error_cm))
+        if error_cm <= tolerance_cm:
+            return 0.0
+
+        slow_radius_cm = max(tolerance_cm, float(slow_radius_cm))
+        if error_cm > slow_radius_cm:
+            return error_cm
+
+        gain = min(0.95, max(0.1, float(gain)))
+        minimum_useful_step_cm = min(error_cm, tolerance_cm)
+        return min(error_cm, max(error_cm * gain, minimum_useful_step_cm))
+
+    def _home_forward_step_cm(self, forward_cm: float, tolerance_cm: float) -> float:
+        return self._home_axis_step_cm(
+            forward_cm,
+            tolerance_cm,
+            self.home_axis_slow_radius_cm,
+            self.home_axis_gain,
+        )
+
+    def _home_strafe_step_cm(self, strafe_cm: float, tolerance_cm: float) -> float:
+        return self._home_axis_step_cm(
+            strafe_cm,
+            tolerance_cm,
+            self.home_strafe_slow_radius_cm,
+            self.home_strafe_gain,
+        )
+
     def _go_home_to_odom_zero(self, label: str) -> None:
         self._raise_if_cancelled()
         tolerance_cm = max(0.5, self.home_tolerance_cm)
-        max_passes = max(1, self.home_max_passes)
+        max_axis_corrections = max(1, self.home_max_axis_corrections)
+        direct_radius_cm = max(tolerance_cm, float(self.home_direct_correction_radius_cm))
         self._wait_for_telemetry(timeout_s=2.0)
         forward_cm = float(self.pose.world_forward_cm)
         strafe_cm = float(self.pose.world_strafe_cm)
         self._publish_event(
             f"{label}: world odom forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
         )
+        home_error_message: str | None = None
 
-        for home_pass in range(1, max_passes + 1):
-            self._raise_if_cancelled()
-            self._wait_for_telemetry(timeout_s=1.0)
-            forward_cm = float(self.pose.world_forward_cm)
-            strafe_cm = float(self.pose.world_strafe_cm)
-            if abs(forward_cm) <= tolerance_cm and abs(strafe_cm) <= tolerance_cm:
-                break
-
-            if abs(forward_cm) > tolerance_cm:
-                direction = "B" if forward_cm > 0.0 else "F"
-                distance_cm = abs(forward_cm)
-                self._publish_event(
-                    f"{label}: home pass {home_pass} world forward {direction} {distance_cm:.1f}cm"
-                )
-                done = self._mission_world_direction_move(direction, distance_cm, 0.0)
-                result = str(done.get("result", ""))
-                if result not in MAP_MOVE_OK_RESULTS:
-                    raise RuntimeError(
-                        f"home forward correction failed: {result or done.get('message', 'unknown')}"
-                    )
-                completed_s = time.monotonic()
-                if self.home_settle_s > 0.0:
-                    time.sleep(self.home_settle_s)
-                self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
-                continue
-
-            direction = "R" if strafe_cm > 0.0 else "L"
-            distance_cm = abs(strafe_cm)
+        self._wait_for_telemetry(timeout_s=1.0)
+        forward_cm = float(self.pose.world_forward_cm)
+        if abs(forward_cm) > tolerance_cm:
+            direction = "B" if forward_cm > 0.0 else "F"
+            distance_cm = abs(forward_cm)
             self._publish_event(
-                f"{label}: home pass {home_pass} world lateral {direction} {distance_cm:.1f}cm"
+                f"{label}: coarse world forward {direction} {distance_cm:.1f}cm"
             )
-            done = self._execute_lateral_as_forward(
-                direction,
-                distance_cm,
-                label=f"{label}: home pass {home_pass} lateral {direction}",
-                bias_note="during home return",
-            )
+            done = self._mission_world_direction_move(direction, distance_cm, 0.0)
             result = str(done.get("result", ""))
             if result not in MAP_MOVE_OK_RESULTS:
                 raise RuntimeError(
-                    f"home lateral correction failed: {result or done.get('message', 'unknown')}"
+                    f"home coarse forward correction failed: {result or done.get('message', 'unknown')}"
                 )
             completed_s = time.monotonic()
             if self.home_settle_s > 0.0:
                 time.sleep(self.home_settle_s)
             self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
 
+        self._wait_for_telemetry(timeout_s=1.0)
+        strafe_cm = float(self.pose.world_strafe_cm)
+        if abs(strafe_cm) > tolerance_cm:
+            direction = "R" if strafe_cm > 0.0 else "L"
+            distance_cm = abs(strafe_cm)
+            self._publish_event(
+                f"{label}: coarse world lateral {direction} {distance_cm:.1f}cm"
+            )
+            done = self._execute_lateral_as_forward(
+                direction,
+                distance_cm,
+                label=f"{label}: coarse lateral {direction}",
+                bias_note="during home return",
+            )
+            result = str(done.get("result", ""))
+            if result not in MAP_MOVE_OK_RESULTS:
+                raise RuntimeError(
+                    f"home coarse lateral correction failed: {result or done.get('message', 'unknown')}"
+                )
+            completed_s = time.monotonic()
+            if self.home_settle_s > 0.0:
+                time.sleep(self.home_settle_s)
+            self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+
+        for polish_pass in range(1, max_axis_corrections + 1):
+            self._raise_if_cancelled()
+            self._wait_for_telemetry(timeout_s=1.0)
+            forward_cm = float(self.pose.world_forward_cm)
+            strafe_cm = float(self.pose.world_strafe_cm)
+            forward_error_cm = abs(forward_cm)
+            strafe_error_cm = abs(strafe_cm)
+            if forward_error_cm <= tolerance_cm and strafe_error_cm <= tolerance_cm:
+                break
+
+            if forward_error_cm > tolerance_cm:
+                direction = "B" if forward_cm > 0.0 else "F"
+                previous_forward_cm = forward_cm
+                distance_cm = min(
+                    self._home_forward_step_cm(forward_cm, tolerance_cm),
+                    direct_radius_cm,
+                )
+                if distance_cm <= 0.0:
+                    continue
+                self._publish_event(
+                    f"{label}: direct polish {polish_pass} world forward {direction} "
+                    f"{distance_cm:.1f}cm for residual {forward_error_cm:.1f}cm"
+                )
+                done = self._home_world_direction_move(
+                    direction,
+                    distance_cm,
+                    label=f"{label}: direct polish {polish_pass} forward {direction}",
+                )
+                result = str(done.get("result", ""))
+                if result not in MAP_MOVE_OK_RESULTS:
+                    raise RuntimeError(
+                        f"home direct forward correction failed: {result or done.get('message', 'unknown')}"
+                    )
+                completed_s = time.monotonic()
+                if self.home_settle_s > 0.0:
+                    time.sleep(self.home_settle_s)
+                self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+                new_forward_cm = float(self.pose.world_forward_cm)
+                if (
+                    abs(new_forward_cm) > abs(previous_forward_cm) + tolerance_cm
+                    and previous_forward_cm * new_forward_cm >= 0.0
+                ):
+                    raise RuntimeError(
+                        "home forward correction diverged: "
+                        f"previous forward={previous_forward_cm:.1f}cm "
+                        f"current forward={new_forward_cm:.1f}cm"
+                    )
+                continue
+
+            direction = "R" if strafe_cm > 0.0 else "L"
+            previous_strafe_cm = strafe_cm
+            distance_cm = min(
+                self._home_strafe_step_cm(strafe_cm, tolerance_cm),
+                direct_radius_cm,
+            )
+            if distance_cm <= 0.0:
+                continue
+            self._publish_event(
+                f"{label}: direct polish {polish_pass} world lateral {direction} "
+                f"{distance_cm:.1f}cm for residual {strafe_error_cm:.1f}cm"
+            )
+            done = self._home_world_direction_move(
+                direction,
+                distance_cm,
+                label=f"{label}: direct polish {polish_pass} lateral {direction}",
+            )
+            result = str(done.get("result", ""))
+            if result not in MAP_MOVE_OK_RESULTS:
+                raise RuntimeError(
+                    f"home direct lateral correction failed: {result or done.get('message', 'unknown')}"
+                )
+            completed_s = time.monotonic()
+            if self.home_settle_s > 0.0:
+                time.sleep(self.home_settle_s)
+            self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+            new_strafe_cm = float(self.pose.world_strafe_cm)
+            if abs(new_strafe_cm) <= tolerance_cm:
+                continue
+            if previous_strafe_cm * new_strafe_cm < 0.0:
+                self._publish_event(
+                    f"{label}: home lateral crossed zero, damping next correction "
+                    f"strafe={new_strafe_cm:.1f}cm"
+                )
+                continue
+            if abs(new_strafe_cm) > abs(previous_strafe_cm) + tolerance_cm:
+                raise RuntimeError(
+                    "home lateral correction diverged: "
+                    f"previous strafe={previous_strafe_cm:.1f}cm current strafe={new_strafe_cm:.1f}cm"
+                )
+
         if self.home_settle_s > 0.0:
             time.sleep(self.home_settle_s)
         self._wait_for_telemetry(timeout_s=1.0)
         forward_cm = float(self.pose.world_forward_cm)
         strafe_cm = float(self.pose.world_strafe_cm)
-        if abs(forward_cm) > tolerance_cm or abs(strafe_cm) > tolerance_cm:
-            raise RuntimeError(
+        if home_error_message is None and (
+            abs(forward_cm) > tolerance_cm or abs(strafe_cm) > tolerance_cm
+        ):
+            home_error_message = (
                 f"home residual world odom forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
             )
 
         self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{label} face forward")
+
+        if home_error_message is not None:
+            raise RuntimeError(home_error_message)
 
         self.map_pose = AudixStoreMap.SPAWN
         self.pose.reset_world()
