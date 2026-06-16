@@ -916,6 +916,34 @@ class RobotManager(Node):
             )
         return self._mission_world_direction_move(direction, distance_cm, 0.0)
 
+    def _home_world_vector_move(
+        self,
+        correction_forward_cm: float,
+        correction_strafe_cm: float,
+        label: str,
+    ) -> dict:
+        distance_cm = math.hypot(float(correction_forward_cm), float(correction_strafe_cm))
+        if distance_cm <= 0.0:
+            return MoveDone(result="completed", heading_deg=self.args.heading).as_dict()
+
+        world_angle_deg = math.degrees(math.atan2(correction_strafe_cm, correction_forward_cm))
+        body_angle_deg = wrap_degrees(world_angle_deg - self.args.heading)
+        timeout_s = max(4.0, distance_cm / 4.0 + 2.0)
+        self._publish_event(
+            f"{label}: direct vector world dF={correction_forward_cm:.1f}cm "
+            f"dS={correction_strafe_cm:.1f}cm body_angle={body_angle_deg:.1f}deg "
+            f"dist={distance_cm:.1f}cm"
+        )
+        return self._execute_segment(
+            body_angle_deg,
+            distance_cm / 100.0,
+            ALL_WATCH_SENSORS | {"back"},
+            MissionMemory(),
+            label=f"{label} direct vector",
+            move_timeout_s=timeout_s,
+            timeout_returns_done=True,
+        )
+
     @staticmethod
     def _lateral_forward_heading_and_bias(direction: str) -> tuple[float, int]:
         direction = direction.upper()
@@ -1400,8 +1428,6 @@ class RobotManager(Node):
     def _go_home_to_odom_zero(self, label: str) -> None:
         self._raise_if_cancelled()
         tolerance_cm = max(0.5, self.home_tolerance_cm)
-        max_axis_corrections = max(1, self.home_max_axis_corrections)
-        direct_radius_cm = max(tolerance_cm, float(self.home_direct_correction_radius_cm))
         self._wait_for_telemetry(timeout_s=2.0)
         forward_cm = float(self.pose.world_forward_cm)
         strafe_cm = float(self.pose.world_strafe_cm)
@@ -1453,95 +1479,27 @@ class RobotManager(Node):
                 time.sleep(self.home_settle_s)
             self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
 
-        for polish_pass in range(1, max_axis_corrections + 1):
-            self._raise_if_cancelled()
-            self._wait_for_telemetry(timeout_s=1.0)
-            forward_cm = float(self.pose.world_forward_cm)
-            strafe_cm = float(self.pose.world_strafe_cm)
-            forward_error_cm = abs(forward_cm)
-            strafe_error_cm = abs(strafe_cm)
-            if forward_error_cm <= tolerance_cm and strafe_error_cm <= tolerance_cm:
-                break
-
-            if forward_error_cm > tolerance_cm:
-                direction = "B" if forward_cm > 0.0 else "F"
-                previous_forward_cm = forward_cm
-                distance_cm = min(
-                    self._home_forward_step_cm(forward_cm, tolerance_cm),
-                    direct_radius_cm,
-                )
-                if distance_cm <= 0.0:
-                    continue
-                self._publish_event(
-                    f"{label}: direct polish {polish_pass} world forward {direction} "
-                    f"{distance_cm:.1f}cm for residual {forward_error_cm:.1f}cm"
-                )
-                done = self._home_world_direction_move(
-                    direction,
-                    distance_cm,
-                    label=f"{label}: direct polish {polish_pass} forward {direction}",
-                )
-                result = str(done.get("result", ""))
-                if result not in MAP_MOVE_OK_RESULTS:
-                    raise RuntimeError(
-                        f"home direct forward correction failed: {result or done.get('message', 'unknown')}"
-                    )
-                completed_s = time.monotonic()
-                if self.home_settle_s > 0.0:
-                    time.sleep(self.home_settle_s)
-                self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
-                new_forward_cm = float(self.pose.world_forward_cm)
-                if (
-                    abs(new_forward_cm) > abs(previous_forward_cm) + tolerance_cm
-                    and previous_forward_cm * new_forward_cm >= 0.0
-                ):
-                    raise RuntimeError(
-                        "home forward correction diverged: "
-                        f"previous forward={previous_forward_cm:.1f}cm "
-                        f"current forward={new_forward_cm:.1f}cm"
-                    )
-                continue
-
-            direction = "R" if strafe_cm > 0.0 else "L"
-            previous_strafe_cm = strafe_cm
-            distance_cm = min(
-                self._home_strafe_step_cm(strafe_cm, tolerance_cm),
-                direct_radius_cm,
-            )
-            if distance_cm <= 0.0:
-                continue
-            self._publish_event(
-                f"{label}: direct polish {polish_pass} world lateral {direction} "
-                f"{distance_cm:.1f}cm for residual {strafe_error_cm:.1f}cm"
-            )
-            done = self._home_world_direction_move(
-                direction,
-                distance_cm,
-                label=f"{label}: direct polish {polish_pass} lateral {direction}",
+        self._raise_if_cancelled()
+        self._wait_for_telemetry(timeout_s=1.0)
+        forward_cm = float(self.pose.world_forward_cm)
+        strafe_cm = float(self.pose.world_strafe_cm)
+        if abs(forward_cm) > tolerance_cm or abs(strafe_cm) > tolerance_cm:
+            correction_forward_cm = -forward_cm
+            correction_strafe_cm = -strafe_cm
+            done = self._home_world_vector_move(
+                correction_forward_cm,
+                correction_strafe_cm,
+                f"{label}: one-shot direct polish",
             )
             result = str(done.get("result", ""))
             if result not in MAP_MOVE_OK_RESULTS:
                 raise RuntimeError(
-                    f"home direct lateral correction failed: {result or done.get('message', 'unknown')}"
+                    f"home direct vector correction failed: {result or done.get('message', 'unknown')}"
                 )
             completed_s = time.monotonic()
             if self.home_settle_s > 0.0:
                 time.sleep(self.home_settle_s)
             self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
-            new_strafe_cm = float(self.pose.world_strafe_cm)
-            if abs(new_strafe_cm) <= tolerance_cm:
-                continue
-            if previous_strafe_cm * new_strafe_cm < 0.0:
-                self._publish_event(
-                    f"{label}: home lateral crossed zero, damping next correction "
-                    f"strafe={new_strafe_cm:.1f}cm"
-                )
-                continue
-            if abs(new_strafe_cm) > abs(previous_strafe_cm) + tolerance_cm:
-                raise RuntimeError(
-                    "home lateral correction diverged: "
-                    f"previous strafe={previous_strafe_cm:.1f}cm current strafe={new_strafe_cm:.1f}cm"
-                )
 
         if self.home_settle_s > 0.0:
             time.sleep(self.home_settle_s)
