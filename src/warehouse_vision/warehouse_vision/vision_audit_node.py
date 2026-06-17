@@ -21,6 +21,13 @@ SHELF_PRODUCTS = {
     "fruit_rings_cereal": "fruit_rings_cereal",
 }
 
+PRODUCT_LABELS = {
+    "Indomie": "Indomie",
+    "indomie": "Indomie",
+    "beans_can": "Beans Can",
+    "fruit_rings_cereal": "Fruit Rings Cereal",
+}
+
 
 class VisionAuditNode(Node):
     def __init__(self):
@@ -93,6 +100,7 @@ class VisionAuditNode(Node):
     def scan_callback(self, request, response):
         trigger_time_s = self.get_clock().now().nanoseconds / 1e9
         shelf_id = request.shelf_id.strip()
+        expected_count = int(request.expected_count) if int(request.expected_count) > 0 else self.target_count
         response.shelf_id = shelf_id
 
         if shelf_id not in SHELF_PRODUCTS:
@@ -108,7 +116,8 @@ class VisionAuditNode(Node):
             response.message = "No fresh camera frame after scan trigger"
             return response
 
-        expected_product = SHELF_PRODUCTS[shelf_id]
+        expected_model_name = SHELF_PRODUCTS[shelf_id]
+        expected_product = PRODUCT_LABELS.get(expected_model_name, expected_model_name.replace("_", " ").title())
         results = self.model(frame, conf=self.confidence_threshold, verbose=False)
 
         count = 0
@@ -120,36 +129,39 @@ class VisionAuditNode(Node):
             cls_id = int(box.cls[0])
             class_name = str(self.model.names[cls_id])
             confidence = float(box.conf[0])
-            detected_products.append(class_name)
+            detected_products.append(PRODUCT_LABELS.get(class_name, class_name.replace("_", " ").title()))
 
-            if class_name == expected_product:
+            if class_name == expected_model_name:
                 count += 1
                 expected_confidences.append(confidence)
             else:
-                wrong_products.append(class_name)
+                wrong_products.append(PRODUCT_LABELS.get(class_name, class_name.replace("_", " ").title()))
 
         detected_products = sorted(set(detected_products))
         wrong_products = sorted(set(wrong_products))
         best_confidence = max(expected_confidences) if expected_confidences else 0.0
 
-        if wrong_products:
-            status = "MISPLACED_PRODUCT"
-            message = f"Wrong product detected: {wrong_products}"
-        elif count > self.target_count:
-            status = "OVER_STOCKED"
-            message = f"Detected {count}, expected {self.target_count}"
-        elif count < self.target_count:
-            status = "UNDER_STOCKED"
-            message = f"Detected {count}, expected {self.target_count}"
+        if not detected_products:
+            status = "Missing Items"
+            message = "shelf is empty"
+        elif wrong_products:
+            status = "Misplaced Items"
+            message = "Wrong product in shelf"
+        elif count > expected_count:
+            status = "Over stocked"
+            message = "correct product but quantity more than expected"
+        elif count < expected_count:
+            status = "Under stocked"
+            message = "correct product but quantity less than expected"
         else:
-            status = "CORRECT_STOCK"
-            message = f"Detected correct stock: {count}"
+            status = "Correct Stock"
+            message = "correct product and quantity matched"
 
         image_path = self._save_annotated_image(results[0], shelf_id, status)
 
         response.success = True
         response.expected_product = expected_product
-        response.expected_count = self.target_count
+        response.expected_count = expected_count
         response.detected_count = count
         response.detected_products = list(detected_products)
         response.wrong_products = list(wrong_products)
@@ -171,7 +183,8 @@ class VisionAuditNode(Node):
         os.makedirs(save_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        image_name = f"{timestamp}_{shelf_id}_{status}.jpg"
+        safe_status = status.lower().replace(" ", "_")
+        image_name = f"{timestamp}_{shelf_id}_{safe_status}.jpg"
         image_path = os.path.join(save_dir, image_name)
         cv2.imwrite(image_path, result.plot())
         return image_path

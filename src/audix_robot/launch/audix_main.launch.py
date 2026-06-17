@@ -24,10 +24,13 @@ def generate_launch_description():
     vision_confidence = LaunchConfiguration("vision_confidence")
     vision_target_count = LaunchConfiguration("vision_target_count")
     vision_scan_settle = LaunchConfiguration("vision_scan_settle")
-    audit_side_1_level_1_shelf_id = LaunchConfiguration("audit_side_1_level_1_shelf_id")
-    audit_side_1_level_2_shelf_id = LaunchConfiguration("audit_side_1_level_2_shelf_id")
-    audit_side_2_level_1_shelf_id = LaunchConfiguration("audit_side_2_level_1_shelf_id")
-    audit_side_2_level_2_shelf_id = LaunchConfiguration("audit_side_2_level_2_shelf_id")
+    audit_side_1_shelf_id = LaunchConfiguration("audit_side_1_shelf_id")
+    audit_side_2_shelf_id = LaunchConfiguration("audit_side_2_shelf_id")
+    audit_default_expected_count = LaunchConfiguration("audit_default_expected_count")
+    traffic_green_pin = LaunchConfiguration("traffic_green_pin")
+    traffic_yellow_pin = LaunchConfiguration("traffic_yellow_pin")
+    traffic_red_pin = LaunchConfiguration("traffic_red_pin")
+    traffic_active_high = LaunchConfiguration("traffic_active_high")
     map_width = LaunchConfiguration("map_width_cm")
     map_height = LaunchConfiguration("map_height_cm")
     map_spawn_x = LaunchConfiguration("map_spawn_x_cm")
@@ -66,10 +69,13 @@ def generate_launch_description():
             DeclareLaunchArgument("vision_confidence", default_value="0.5"),
             DeclareLaunchArgument("vision_target_count", default_value="2"),
             DeclareLaunchArgument("vision_scan_settle", default_value="0.5"),
-            DeclareLaunchArgument("audit_side_1_level_1_shelf_id", default_value="beans_can"),
-            DeclareLaunchArgument("audit_side_1_level_2_shelf_id", default_value="indomie"),
-            DeclareLaunchArgument("audit_side_2_level_1_shelf_id", default_value="indomie"),
-            DeclareLaunchArgument("audit_side_2_level_2_shelf_id", default_value="fruit_rings_cereal"),
+            DeclareLaunchArgument("audit_side_1_shelf_id", default_value="indomie"),
+            DeclareLaunchArgument("audit_side_2_shelf_id", default_value="fruit_rings_cereal"),
+            DeclareLaunchArgument("audit_default_expected_count", default_value="2"),
+            DeclareLaunchArgument("traffic_green_pin", default_value="16"),
+            DeclareLaunchArgument("traffic_yellow_pin", default_value="20"),
+            DeclareLaunchArgument("traffic_red_pin", default_value="21"),
+            DeclareLaunchArgument("traffic_active_high", default_value="true"),
             DeclareLaunchArgument("map_width_cm", default_value="300.0"),
             DeclareLaunchArgument("map_height_cm", default_value="210.0"),
             DeclareLaunchArgument("map_spawn_x_cm", default_value="25.0"),
@@ -124,6 +130,10 @@ def generate_launch_description():
                         "mock_ir": ParameterValue(mock_ir, value_type=bool),
                         "ir_enabled": ParameterValue(ir_enabled, value_type=bool),
                         "ir_logic": ir_logic,
+                        "traffic_green_pin": ParameterValue(traffic_green_pin, value_type=int),
+                        "traffic_yellow_pin": ParameterValue(traffic_yellow_pin, value_type=int),
+                        "traffic_red_pin": ParameterValue(traffic_red_pin, value_type=int),
+                        "traffic_active_high": ParameterValue(traffic_active_high, value_type=bool),
                     }
                 ],
             ),
@@ -137,10 +147,12 @@ def generate_launch_description():
                     {
                         "allow_placeholder_audit": ParameterValue(allow_placeholder_audit, value_type=bool),
                         "vision_scan_settle_s": ParameterValue(vision_scan_settle, value_type=float),
-                        "audit_side_1_level_1_shelf_id": audit_side_1_level_1_shelf_id,
-                        "audit_side_1_level_2_shelf_id": audit_side_1_level_2_shelf_id,
-                        "audit_side_2_level_1_shelf_id": audit_side_2_level_1_shelf_id,
-                        "audit_side_2_level_2_shelf_id": audit_side_2_level_2_shelf_id,
+                        "audit_side_1_shelf_id": audit_side_1_shelf_id,
+                        "audit_side_2_shelf_id": audit_side_2_shelf_id,
+                        "audit_default_expected_count": ParameterValue(
+                            audit_default_expected_count,
+                            value_type=int,
+                        ),
                         "map_width_cm": ParameterValue(map_width, value_type=float),
                         "map_height_cm": ParameterValue(map_height, value_type=float),
                         "map_spawn_x_cm": ParameterValue(map_spawn_x, value_type=float),

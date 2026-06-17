@@ -19,6 +19,7 @@ from audix_interfaces.srv import (
     Move,
     RotateCommand,
     SetRobotMode,
+    SetTrafficLight,
     ShelfScan,
 )
 from audix_robot.navigation_contract import (
@@ -300,15 +301,21 @@ class RobotManager(Node):
         )
         self.home_strafe_gain = float(self.declare_parameter("home_strafe_gain", 0.6).value)
         self.audit_shelf_ids = {
-            (1, 1): str(self.declare_parameter("audit_side_1_level_1_shelf_id", "beans_can").value),
-            (1, 2): str(self.declare_parameter("audit_side_1_level_2_shelf_id", "indomie").value),
-            (2, 1): str(self.declare_parameter("audit_side_2_level_1_shelf_id", "indomie").value),
-            (2, 2): str(self.declare_parameter("audit_side_2_level_2_shelf_id", "fruit_rings_cereal").value),
+            1: str(self.declare_parameter("audit_side_1_shelf_id", "indomie").value),
+            2: str(self.declare_parameter("audit_side_2_shelf_id", "fruit_rings_cereal").value),
         }
+        self.audit_default_expected_count = int(
+            self.declare_parameter("audit_default_expected_count", 2).value
+        )
 
         self.move_client = self.create_client(Move, "move", callback_group=self.callback_group)
         self.stop_client = self.create_client(Trigger, "esp/stop", callback_group=self.callback_group)
         self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
+        self.traffic_light_client = self.create_client(
+            SetTrafficLight,
+            "gpio/set_traffic_light",
+            callback_group=self.callback_group,
+        )
         self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps", callback_group=self.callback_group)
         self.scan_client = self.create_client(ShelfScan, "scan_shelf", callback_group=self.callback_group)
 
@@ -415,6 +422,14 @@ class RobotManager(Node):
             self._call_sync(self.buzzer_client, req, 1.0)
         except Exception as exc:
             self.get_logger().warning(f"buzzer request failed: {exc}")
+
+    def _set_traffic_light(self, state: str) -> None:
+        try:
+            req = SetTrafficLight.Request()
+            req.state = state
+            self._call_sync(self.traffic_light_client, req, 0.5)
+        except Exception as exc:
+            self.get_logger().warning(f"traffic light request failed: {exc}")
 
     def _stop_robot(self) -> None:
         try:
@@ -1320,63 +1335,78 @@ class RobotManager(Node):
             raise RuntimeError(f"rotation {label} failed: {done.get('message', done.get('result', 'unknown'))}")
         self.args.heading = float(done.get("headingDeg", target))
 
-    def _capture_level_placeholder(self, side: int, level: int) -> None:
+    def _capture_scan_placeholder(self, side: int) -> None:
         self._raise_if_cancelled()
-        self._publish_event(f"audit {AudixStoreMap.SIDE_NAME[side]} level {level}: vision placeholder")
+        self._publish_event(f"audit {AudixStoreMap.SIDE_NAME[side]}: vision placeholder")
         time.sleep(2.0)
 
-    def _scan_shelf_level(self, side: int, level: int) -> None:
+    def _scan_shelf_side(
+        self,
+        side: int,
+        shelf_ids_by_side: dict[int, str],
+        expected_counts_by_side: dict[int, int],
+    ) -> None:
         self._raise_if_cancelled()
-        shelf_id = self.audit_shelf_ids.get((side, level), "")
+        shelf_id = shelf_ids_by_side.get(side, self.audit_shelf_ids.get(side, ""))
+        expected_count = max(1, int(expected_counts_by_side.get(side, self.audit_default_expected_count)))
         if not shelf_id:
-            raise RuntimeError(f"no shelf id configured for side {side} level {level}")
+            raise RuntimeError(f"no shelf id configured for side {side}")
 
         self._publish_event(
-            f"ready facing {AudixStoreMap.SIDE_NAME[side]} level {level}: trigger scan {shelf_id}"
+            f"{AudixStoreMap.SIDE_NAME[side]}: extend lift for scan {shelf_id} expected_count={expected_count}"
         )
-        if self.scan_settle_s > 0.0:
-            time.sleep(self.scan_settle_s)
-        req = ShelfScan.Request()
-        req.shelf_id = shelf_id
-
+        self._run_lift(self.lift_steps, 1)
         try:
-            result = self._call_sync(self.scan_client, req, self.scan_timeout_s)
-        except Exception as exc:
-            if self.allow_placeholder_audit:
-                self._publish_event(
-                    f"vision unavailable for {shelf_id}: {exc}; using placeholder wait"
-                )
-                self._capture_level_placeholder(side, level)
-                return
-            raise
+            self._publish_event(
+                f"ready facing {AudixStoreMap.SIDE_NAME[side]}: trigger scan {shelf_id}"
+            )
+            if self.scan_settle_s > 0.0:
+                time.sleep(self.scan_settle_s)
+            req = ShelfScan.Request()
+            req.shelf_id = shelf_id
+            req.expected_count = expected_count
 
-        if not result.success:
-            self._publish_scan_result(side, level, result)
-            if self.allow_placeholder_audit:
-                self._publish_event(
-                    f"vision scan failed for {shelf_id}: {result.message}; using placeholder wait"
-                )
-                self._capture_level_placeholder(side, level)
-                return
-            raise RuntimeError(f"vision scan failed for {shelf_id}: {result.message}")
+            try:
+                result = self._call_sync(self.scan_client, req, self.scan_timeout_s)
+            except Exception as exc:
+                if self.allow_placeholder_audit:
+                    self._publish_event(
+                        f"vision unavailable for {shelf_id}: {exc}; using placeholder wait"
+                    )
+                    self._capture_scan_placeholder(side)
+                    return
+                raise
 
-        self._publish_event(
-            "vision "
-            f"{shelf_id}: {result.status} "
-            f"expected={result.expected_product} "
-            f"count={result.detected_count}/{result.expected_count} "
-            f"confidence={float(result.confidence):.2f} "
-            f"wrong={list(result.wrong_products)}"
-        )
-        self._publish_scan_result(side, level, result)
+            if not result.success:
+                self._publish_scan_result(side, result)
+                if self.allow_placeholder_audit:
+                    self._publish_event(
+                        f"vision scan failed for {shelf_id}: {result.message}; using placeholder wait"
+                    )
+                    self._capture_scan_placeholder(side)
+                    return
+                raise RuntimeError(f"vision scan failed for {shelf_id}: {result.message}")
 
-    def _publish_scan_result(self, side: int, level: int, result) -> None:
+            self._publish_event(
+                "vision "
+                f"{shelf_id}: {result.status} "
+                f"expected={result.expected_product} "
+                f"count={result.detected_count}/{result.expected_count} "
+                f"confidence={float(result.confidence):.2f} "
+                f"wrong={list(result.wrong_products)}"
+            )
+            self._publish_scan_result(side, result)
+        finally:
+            self._publish_event(f"{AudixStoreMap.SIDE_NAME[side]}: retract lift after scan")
+            self._run_lift(self.lift_steps, -1)
+
+    def _publish_scan_result(self, side: int, result) -> None:
         msg = String()
         msg.data = json.dumps(
             {
                 "success": bool(result.success),
                 "side": int(side),
-                "level": int(level),
+                "level": 1,
                 "shelf_id": str(result.shelf_id),
                 "expected_product": str(result.expected_product),
                 "expected_count": int(result.expected_count),
@@ -1391,16 +1421,6 @@ class RobotManager(Node):
         )
         self.scan_result_pub.publish(msg)
 
-    def _audit_side_levels(self, side: int, levels: list[int]) -> None:
-        if 1 in levels:
-            self._scan_shelf_level(side, 1)
-        if 2 in levels:
-            self._run_lift(self.lift_steps, 1)
-            try:
-                self._scan_shelf_level(side, 2)
-            finally:
-                self._run_lift(self.lift_steps, -1)
-
     def _return_to_lane_start_after_scan(self, side: int) -> None:
         side_name = AudixStoreMap.SIDE_NAME[side]
         self._execute_rotation_to_heading(
@@ -1412,28 +1432,36 @@ class RobotManager(Node):
             f"{side_name} return to lane start",
         )
 
-    def _run_map_audit(self, sides: list[int], levels: list[int]) -> None:
+    def _run_map_audit(
+        self,
+        sides: list[int],
+        shelf_ids_by_side: dict[int, str],
+        expected_counts_by_side: dict[int, int],
+    ) -> None:
         try:
             with self.mode_lock:
                 self.mode = "mission"
+            self._set_traffic_light("yellow")
             self.current_audit_side = None
             self._reset_map_pose()
             self._publish_event(
                 "map mission start "
                 f"size={AudixStoreMap.WIDTH_CM:.0f}x{AudixStoreMap.HEIGHT_CM:.0f}cm "
-                f"sides={sides} levels={levels}"
+                f"sides={sides} single_level_scan=true shelf_ids={shelf_ids_by_side} counts={expected_counts_by_side}"
             )
 
             for side in sides:
                 self._raise_if_cancelled()
                 self._go_to_audit_side(side)
                 scan_heading = AudixStoreMap.SCAN_HEADING_DEG[side]
-                self._execute_rotation_to_heading(scan_heading, f"face {AudixStoreMap.SIDE_NAME[side]}")
                 side_scans_complete = False
+                self._set_traffic_light("green")
                 try:
-                    self._audit_side_levels(side, levels)
+                    self._execute_rotation_to_heading(scan_heading, f"face {AudixStoreMap.SIDE_NAME[side]}")
+                    self._scan_shelf_side(side, shelf_ids_by_side, expected_counts_by_side)
                     side_scans_complete = True
                 finally:
+                    self._set_traffic_light("yellow")
                     if not self.cancel_mission.is_set():
                         if side_scans_complete:
                             self._return_to_lane_start_after_scan(side)
@@ -1452,6 +1480,7 @@ class RobotManager(Node):
             self.current_audit_side = None
             with self.mode_lock:
                 self.mode = "manual"
+            self._set_traffic_light("red")
 
     def _handle_set_mode(self, request: SetRobotMode.Request, response: SetRobotMode.Response) -> SetRobotMode.Response:
         mode = request.mode.strip().lower()
@@ -1464,8 +1493,10 @@ class RobotManager(Node):
             self.mode = mode
         if mode == "mission":
             self.cancel_mission.clear()
+            self._set_traffic_light("yellow")
         else:
             self.cancel_mission.set()
+            self._set_traffic_light("red")
         response.ok = True
         response.message = f"mode set to {mode}"
         response.active_mode = mode
@@ -1498,16 +1529,20 @@ class RobotManager(Node):
                         response.result = "manual_ir_stop"
                         response.message = f"manual obstacle stop: {active}"
                         return response
+                    self._set_traffic_light("yellow")
                     angle = DIRECTION_ANGLES_DEG[direction]
-                    done = self._execute_segment(
-                        angle,
-                        max(0.0, float(request.distance_cm)) / 100.0,
-                        set(),
-                        None,
-                        label=f"manual {direction}",
-                        move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
-                        timeout_returns_done=True,
-                    )
+                    try:
+                        done = self._execute_segment(
+                            angle,
+                            max(0.0, float(request.distance_cm)) / 100.0,
+                            set(),
+                            None,
+                            label=f"manual {direction}",
+                            move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
+                            timeout_returns_done=True,
+                        )
+                    finally:
+                        self._set_traffic_light("red")
                 else:
                     done = self._mission_direction_move(direction, float(request.distance_cm), float(request.timeout_s))
             except Exception as exc:
@@ -1551,14 +1586,18 @@ class RobotManager(Node):
                     response.message = f"manual obstacle stop: {active}"
                     response.heading_deg = self._current_heading_deg()
                     return response
+                self._set_traffic_light("yellow")
                 self._publish_event(f"rotate {direction} {request.degrees:.1f}deg target={target:.1f}")
-                future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
-                result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
-                if result is not None:
-                    done = self._move_done_from_response(result)
-                else:
-                    self._stop_robot()
-                    done = MoveDone(result="timeout_stop", heading_deg=self._current_heading_deg()).as_dict()
+                try:
+                    future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+                    result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+                    if result is not None:
+                        done = self._move_done_from_response(result)
+                    else:
+                        self._stop_robot()
+                        done = MoveDone(result="timeout_stop", heading_deg=self._current_heading_deg()).as_dict()
+                finally:
+                    self._set_traffic_light("red")
             except Exception as exc:
                 self._stop_robot()
                 self.get_logger().error(f"rotate failed: {exc}")
@@ -1576,29 +1615,46 @@ class RobotManager(Node):
 
     def _handle_start_audit(self, request: AuditMission.Request, response: AuditMission.Response) -> AuditMission.Response:
         sides = [int(side) for side in request.shelves if 1 <= int(side) <= 2]
-        levels = []
-        if request.level_1:
-            levels.append(1)
-        if request.level_2:
-            levels.append(2)
         if not sides:
             response.accepted = False
             response.message = "select at least one shelf side"
-            return response
-        if not levels:
-            response.accepted = False
-            response.message = "select at least one level"
             return response
 
         if self.mission_running:
             response.accepted = False
             response.message = "mission already running"
             return response
+
+        shelf_ids_by_side = dict(self.audit_shelf_ids)
+        expected_counts_by_side = {
+            1: self.audit_default_expected_count,
+            2: self.audit_default_expected_count,
+        }
+        for index, raw_side in enumerate(request.shelves):
+            side = int(raw_side)
+            if side not in {1, 2}:
+                continue
+            if index < len(request.shelf_ids):
+                shelf_id = str(request.shelf_ids[index]).strip()
+                if shelf_id:
+                    shelf_ids_by_side[side] = shelf_id
+            if index < len(request.expected_counts):
+                expected_count = int(request.expected_counts[index])
+                if expected_count > 0:
+                    expected_counts_by_side[side] = expected_count
+
         self.cancel_mission.clear()
         self.mission_running = True
-        threading.Thread(target=self._run_map_audit, args=(sides, levels), daemon=True).start()
+        threading.Thread(
+            target=self._run_map_audit,
+            args=(sides, shelf_ids_by_side, expected_counts_by_side),
+            daemon=True,
+        ).start()
         response.accepted = True
-        response.message = f"audit mission started sides={sides} levels={levels}"
+        response.message = (
+            f"audit mission started sides={sides} "
+            f"shelf_ids={shelf_ids_by_side} counts={expected_counts_by_side} single_level_scan=true"
+        )
         return response
 
     def _wait_for_telemetry(
@@ -1774,6 +1830,7 @@ class RobotManager(Node):
                     previous_mode = self.mode
                     self.mode = "mission"
                 self.cancel_mission.clear()
+                self._set_traffic_light("yellow")
                 self._go_home_to_odom_zero("manual home")
                 response.success = True
                 response.message = "home reached odom zero"
@@ -1784,12 +1841,14 @@ class RobotManager(Node):
             finally:
                 with self.mode_lock:
                     self.mode = previous_mode if "previous_mode" in locals() else "manual"
+                self._set_traffic_light("red")
         return response
 
     def _handle_manager_stop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.cancel_mission.set()
         self._stop_robot()
         self._set_buzzer(False)
+        self._set_traffic_light("red")
         with self.mode_lock:
             self.mode = "manual"
         response.success = True

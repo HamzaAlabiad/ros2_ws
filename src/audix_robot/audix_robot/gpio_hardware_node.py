@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPIO output services for Audix buzzer and scissor-lift stepper."""
+"""GPIO output services for Audix buzzer, traffic lights, and scissor-lift stepper."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 
 import rclpy
 from audix_interfaces.msg import IrState
-from audix_interfaces.srv import LiftMoveSteps
+from audix_interfaces.srv import LiftMoveSteps, SetTrafficLight
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -25,6 +25,10 @@ STEPPER_SPEED_SPS = 500.0
 STEPPER_UP_DIR = 1
 STEPPER_DOWN_DIR = -1
 DEFAULT_BUZZER_PIN = 19
+TRAFFIC_GREEN_PIN = 16
+TRAFFIC_YELLOW_PIN = 20
+TRAFFIC_RED_PIN = 21
+TRAFFIC_STATES = {"green", "yellow", "red", "off"}
 IR_SENSOR_ORDER = ("front_left", "front", "front_right", "right", "back", "left")
 IR_PINS = {
     "front_left": 23,
@@ -93,6 +97,10 @@ class GpioHardware(Node):
         self.base_frame_id = str(self.declare_parameter("base_frame_id", "base_link").value)
         self.buzzer_pin = int(self.declare_parameter("buzzer_pin", DEFAULT_BUZZER_PIN).value)
         self.buzzer_active_high = bool(self.declare_parameter("buzzer_active_high", True).value)
+        self.traffic_green_pin = int(self.declare_parameter("traffic_green_pin", TRAFFIC_GREEN_PIN).value)
+        self.traffic_yellow_pin = int(self.declare_parameter("traffic_yellow_pin", TRAFFIC_YELLOW_PIN).value)
+        self.traffic_red_pin = int(self.declare_parameter("traffic_red_pin", TRAFFIC_RED_PIN).value)
+        self.traffic_active_high = bool(self.declare_parameter("traffic_active_high", True).value)
         self.step_pin = int(self.declare_parameter("step_pin", STEPPER_STEP_PIN).value)
         self.dir_pin = int(self.declare_parameter("dir_pin", STEPPER_DIR_PIN).value)
         self.en_pin = int(self.declare_parameter("en_pin", STEPPER_EN_PIN).value)
@@ -100,6 +108,7 @@ class GpioHardware(Node):
         self.step_high_us = int(self.declare_parameter("step_high_us", STEPPER_STEP_HIGH_US).value)
 
         self.buzzer: Any | None = None
+        self.traffic_lights: dict[str, Any] = {}
         self.step_device: Any | None = None
         self.dir_device: Any | None = None
         self.en_device: Any | None = None
@@ -112,6 +121,12 @@ class GpioHardware(Node):
             self._open_gpio()
 
         self.create_service(SetBool, "gpio/set_buzzer", self._handle_set_buzzer, callback_group=self.callback_group)
+        self.create_service(
+            SetTrafficLight,
+            "gpio/set_traffic_light",
+            self._handle_set_traffic_light,
+            callback_group=self.callback_group,
+        )
         self.create_service(LiftMoveSteps, "lift/move_steps", self._handle_lift_move_steps, callback_group=self.callback_group)
         if self.ir_enabled:
             self.ir_bank = GpioIrBank(
@@ -133,11 +148,30 @@ class GpioHardware(Node):
             active_high=self.buzzer_active_high,
             initial_value=False,
         )
+        self.traffic_lights = {
+            "green": OutputDevice(
+                self.traffic_green_pin,
+                active_high=self.traffic_active_high,
+                initial_value=False,
+            ),
+            "yellow": OutputDevice(
+                self.traffic_yellow_pin,
+                active_high=self.traffic_active_high,
+                initial_value=False,
+            ),
+            "red": OutputDevice(
+                self.traffic_red_pin,
+                active_high=self.traffic_active_high,
+                initial_value=False,
+            ),
+        }
         self.step_device = DigitalOutputDevice(self.step_pin, initial_value=False)
         self.dir_device = DigitalOutputDevice(self.dir_pin, initial_value=False)
         self.en_device = DigitalOutputDevice(self.en_pin, initial_value=True)
+        self._set_traffic_light_state("red")
         self.get_logger().info(
             f"GPIO ready buzzer=GPIO{self.buzzer_pin} "
+            f"traffic G/Y/R=GPIO{self.traffic_green_pin}/GPIO{self.traffic_yellow_pin}/GPIO{self.traffic_red_pin} "
             f"STEP=GPIO{self.step_pin} DIR=GPIO{self.dir_pin} EN=GPIO{self.en_pin}"
         )
 
@@ -156,6 +190,36 @@ class GpioHardware(Node):
             self.buzzer.off()
         response.success = True
         response.message = "buzzer on" if request.data else "buzzer off"
+        return response
+
+    def _set_traffic_light_state(self, state: str) -> None:
+        for device in self.traffic_lights.values():
+            device.off()
+        if state != "off":
+            self.traffic_lights[state].on()
+
+    def _handle_set_traffic_light(
+        self,
+        request: SetTrafficLight.Request,
+        response: SetTrafficLight.Response,
+    ) -> SetTrafficLight.Response:
+        state = request.state.strip().lower()
+        if state not in TRAFFIC_STATES:
+            response.success = False
+            response.message = "traffic state must be green, yellow, red, or off"
+            return response
+        if self.mock_gpio:
+            response.success = True
+            response.message = f"mock traffic light {state}"
+            return response
+        if len(self.traffic_lights) != 3:
+            response.success = False
+            response.message = "traffic light GPIO unavailable"
+            return response
+
+        self._set_traffic_light_state(state)
+        response.success = True
+        response.message = f"traffic light {state}"
         return response
 
     def _handle_lift_move_steps(
@@ -238,6 +302,16 @@ class GpioHardware(Node):
         self.ir_pub.publish(msg)
 
     def destroy_node(self) -> bool:
+        for device in self.traffic_lights.values():
+            try:
+                device.off()
+            except Exception:
+                pass
+            try:
+                device.close()
+            except Exception:
+                pass
+        self.traffic_lights = {}
         for device, off_first in (
             (self.buzzer, True),
             (self.step_device, True),

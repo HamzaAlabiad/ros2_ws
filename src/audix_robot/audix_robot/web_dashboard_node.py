@@ -80,12 +80,34 @@ INDEX_HTML = r"""<!doctype html>
     .ir { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 8px; }
     .pill { border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; color: var(--muted); }
     .pill.on { color: white; background: #4a1c22; border-color: var(--danger); }
-    .sides { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+    .audit-rows { display: grid; gap: 8px; }
+    .audit-row {
+      display: grid; grid-template-columns: minmax(120px, 1fr) minmax(190px, 1.3fr) 120px;
+      gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+      background: #111820;
+    }
+    .audit-row label { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
+    .audit-row select, .audit-row input { width: 100%; }
     .vision { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; margin-top: 10px; }
     .camera-feed { width: 100%; max-height: 320px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; background: #07090c; margin-bottom: 10px; }
     .scan-image { display: none; width: 100%; max-height: 260px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; background: #07090c; }
+    .scan-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+    .scan-card { border: 1px solid var(--line); border-radius: 8px; background: #10161d; overflow: hidden; }
+    .scan-card img { width: 100%; height: 150px; object-fit: contain; background: #07090c; border-bottom: 1px solid var(--line); display: block; cursor: zoom-in; }
+    .scan-card-body { padding: 10px; }
+    .scan-card-title { display: flex; justify-content: space-between; gap: 8px; font-weight: 700; margin-bottom: 6px; }
+    .scan-card-meta { color: var(--muted); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+    .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; }
+    .section-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .section-head h2 { margin: 0; }
+    .count-badge { color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font-size: 12px; }
+    .image-modal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,0.78); z-index: 20; }
+    .image-modal.open { display: flex; }
+    .image-modal-inner { width: min(980px, 100%); max-height: 92vh; border: 1px solid var(--line); border-radius: 10px; background: #090d12; overflow: hidden; }
+    .image-modal-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--muted); }
+    .image-modal img { width: 100%; max-height: 78vh; object-fit: contain; display: block; background: #05070a; }
     label { color: var(--muted); font-size: 13px; }
-    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .sides, .vision { grid-template-columns: repeat(1, minmax(0,1fr)); } }
+    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .audit-row, .vision { grid-template-columns: repeat(1, minmax(0,1fr)); } }
   </style>
 </head>
 <body>
@@ -161,13 +183,27 @@ INDEX_HTML = r"""<!doctype html>
     <section class="wide">
       <h2>Mission Audit</h2>
       <div class="panel">
-        <div class="sides">
-          <label><input type="checkbox" class="side" value="1" checked /> Lane 1 side</label>
-          <label><input type="checkbox" class="side" value="2" /> Lane 2 side</label>
+        <div class="audit-rows">
+          <div class="audit-row" data-lane="1">
+            <label><input type="checkbox" id="lane1Enabled" class="side" value="1" checked /> Lane 1 side</label>
+            <select id="lane1Product">
+              <option value="indomie" selected>Indomie</option>
+              <option value="fruit_rings_cereal">Fruit Rings Cereal</option>
+              <option value="beans_can">Beans Can</option>
+            </select>
+            <label>Quantity <input id="lane1Qty" type="number" min="1" max="20" step="1" value="2" /></label>
+          </div>
+          <div class="audit-row" data-lane="2">
+            <label><input type="checkbox" id="lane2Enabled" class="side" value="2" /> Lane 2 side</label>
+            <select id="lane2Product">
+              <option value="indomie">Indomie</option>
+              <option value="fruit_rings_cereal" selected>Fruit Rings Cereal</option>
+              <option value="beans_can">Beans Can</option>
+            </select>
+            <label>Quantity <input id="lane2Qty" type="number" min="1" max="20" step="1" value="2" /></label>
+          </div>
         </div>
         <div class="row" style="margin-top:10px">
-          <label><input id="level1" type="checkbox" checked /> Level 1</label>
-          <label><input id="level2" type="checkbox" checked /> Level 2</label>
           <button class="accent" onclick="startAudit()">Start Audit</button>
           <button class="warn" onclick="lift(500)">Jog +500</button>
           <button class="warn" onclick="lift(-500)">Jog -500</button>
@@ -183,8 +219,9 @@ INDEX_HTML = r"""<!doctype html>
           <select id="scanShelf">
             <option value="indomie">Indomie</option>
             <option value="beans_can">Beans Can</option>
-            <option value="fruit_rings_cereal">Fruit Rings</option>
+            <option value="fruit_rings_cereal">Fruit Rings Cereal</option>
           </select>
+          <label>Quantity <input id="scanQty" type="number" min="1" max="20" step="1" value="2" /></label>
           <button class="accent" onclick="scanShelf()">Scan</button>
         </div>
         <div class="vision">
@@ -193,7 +230,19 @@ INDEX_HTML = r"""<!doctype html>
           <div class="metric"><span>Confidence</span><strong id="scanConfidence">-</strong></div>
         </div>
         <div id="scanMessage" style="color:var(--muted); margin-top:8px; overflow-wrap:anywhere"></div>
-        <img id="scanImage" class="scan-image" alt="latest scan" />
+        <img id="scanImage" class="scan-image" alt="latest scan" onclick="openImageModal(this.src, 'Latest scan')" />
+      </div>
+    </section>
+
+    <section class="wide">
+      <div class="panel">
+        <div class="section-head">
+          <h2>Last Mission Results</h2>
+          <span id="missionScanTotal" class="count-badge">0 scans</span>
+        </div>
+        <div id="missionScans" class="scan-results">
+          <div class="empty">No mission scans yet.</div>
+        </div>
       </div>
     </section>
 
@@ -203,10 +252,28 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </div>
 </main>
+<div id="imageModal" class="image-modal" onclick="closeImageModal(event)">
+  <div class="image-modal-inner">
+    <div class="image-modal-bar">
+      <span id="imageModalTitle">Scan image</span>
+      <button onclick="closeImageModal()">Close</button>
+    </div>
+    <img id="imageModalImg" alt="annotated scan preview" />
+  </div>
+</div>
 <script>
 const logEl = document.getElementById('log');
+const PRODUCT_LABELS = {
+  indomie: 'Indomie',
+  fruit_rings_cereal: 'Fruit Rings Cereal',
+  beans_can: 'Beans Can',
+  Indomie: 'Indomie',
+  'Fruit Rings Cereal': 'Fruit Rings Cereal',
+  'Beans Can': 'Beans Can'
+};
 let lastSeenEvent = '';
 let lastCameraOk = false;
+let lastMissionScanKey = '';
 function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
@@ -227,26 +294,45 @@ function setMode(mode) { post('/api/mode', {mode}); }
 function trigger(path) { post(path); }
 function buzzer(on) { post('/api/buzzer', {on}); }
 function lift(steps) { post('/api/lift', {steps}); }
+function productLabel(value) {
+  const raw = String(value ?? '');
+  return PRODUCT_LABELS[raw] || raw.replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+}
+function cleanList(values) {
+  return (values || []).map(productLabel).join(', ');
+}
 async function scanShelf() {
   const shelf_id = document.getElementById('scanShelf').value;
-  const data = await post('/api/scan', {shelf_id});
+  const expected_count = Math.max(1, Number(document.getElementById('scanQty').value || 2));
+  const data = await post('/api/scan', {shelf_id, expected_count});
   if (data.scan) renderScan(data.scan);
 }
 function startAudit() {
-  const shelves = [...document.querySelectorAll('.side:checked')].map(x => Number(x.value));
-  post('/api/audit', {shelves, level_1: document.getElementById('level1').checked, level_2: document.getElementById('level2').checked});
+  const shelves = [];
+  const shelf_ids = [];
+  const expected_counts = [];
+  for (const side of [1, 2]) {
+    if (!document.getElementById(`lane${side}Enabled`).checked) continue;
+    shelves.push(side);
+    shelf_ids.push(document.getElementById(`lane${side}Product`).value);
+    expected_counts.push(Math.max(1, Number(document.getElementById(`lane${side}Qty`).value || 2)));
+  }
+  post('/api/audit', {shelves, shelf_ids, expected_counts, level_1: true, level_2: false});
 }
 function setText(id, value) { document.getElementById(id).textContent = value; }
 function setIr(id, active) { document.getElementById(id).classList.toggle('on', !!active); }
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
 function renderScan(scan) {
   setText('scanStatus', scan?.status || '-');
   const count = scan ? `${scan.detected_count ?? 0}/${scan.expected_count ?? 0}` : '-';
   setText('scanCount', count);
   const confidence = Number(scan?.confidence ?? 0);
   setText('scanConfidence', scan ? confidence.toFixed(2) : '-');
-  const wrong = (scan?.wrong_products || []).join(', ');
-  const location = scan?.side && scan?.level ? `side ${scan.side} level ${scan.level} | ` : '';
-  document.getElementById('scanMessage').textContent = scan ? `${location}${scan.shelf_id}: ${scan.message || ''}${wrong ? ' | wrong: ' + wrong : ''}` : '';
+  const wrong = cleanList(scan?.wrong_products || []);
+  const location = scan?.side ? `side ${scan.side} | ` : '';
+  document.getElementById('scanMessage').textContent = scan ? `${location}${productLabel(scan.shelf_id)}: ${scan.message || ''}${wrong ? ' | wrong: ' + wrong : ''}` : '';
   const img = document.getElementById('scanImage');
   if (scan?.image_path) {
     img.src = `/api/audit_image?path=${encodeURIComponent(scan.image_path)}&t=${Date.now()}`;
@@ -255,6 +341,65 @@ function renderScan(scan) {
     img.removeAttribute('src');
     img.style.display = 'none';
   }
+}
+function imageUrl(path) {
+  return `/api/audit_image?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+}
+function openImageModal(src, title) {
+  if (!src) return;
+  document.getElementById('imageModalImg').src = src;
+  document.getElementById('imageModalTitle').textContent = title || 'Scan image';
+  document.getElementById('imageModal').classList.add('open');
+}
+function closeImageModal(event) {
+  if (event) {
+    event.stopPropagation();
+    if (event.target.closest && event.target.closest('.image-modal-inner') && event.target.id !== 'imageModal') return;
+  }
+  document.getElementById('imageModal').classList.remove('open');
+  document.getElementById('imageModalImg').removeAttribute('src');
+}
+function renderMissionScans(scans) {
+  const root = document.getElementById('missionScans');
+  const items = Array.isArray(scans) ? scans : [];
+  setText('missionScanTotal', `${items.length} scan${items.length === 1 ? '' : 's'}`);
+  const key = JSON.stringify(items.map(scan => [
+    scan?.side, scan?.shelf_id, scan?.status,
+    scan?.detected_count, scan?.expected_count, scan?.confidence, scan?.image_path
+  ]));
+  if (key === lastMissionScanKey) return;
+  lastMissionScanKey = key;
+  if (!items.length) {
+    root.innerHTML = '<div class="empty">No mission scans yet.</div>';
+    return;
+  }
+  root.innerHTML = items.map((scan, index) => {
+    const wrong = cleanList(scan?.wrong_products || []);
+    const detected = cleanList(scan?.detected_products || []);
+    const url = scan?.image_path ? imageUrl(scan.image_path) : '';
+    const title = `Lane ${scan?.side || '-'} ${productLabel(scan?.shelf_id || 'scan')}`;
+    const img = url
+      ? `<img alt="${escapeHtml(title)}" src="${url}" onclick="openImageModal(this.src, this.alt)" />`
+      : '<div class="empty">No image</div>';
+    return `<article class="scan-card">
+      ${img}
+      <div class="scan-card-body">
+        <div class="scan-card-title">
+          <span>${escapeHtml(productLabel(scan?.shelf_id || 'scan'))}</span>
+          <span>${escapeHtml(scan?.status || '-')}</span>
+        </div>
+        <div class="scan-card-meta">
+          Lane ${escapeHtml(scan?.side || '-')}<br>
+          Count ${escapeHtml(scan?.detected_count ?? 0)}/${escapeHtml(scan?.expected_count ?? 0)}
+          &middot; Confidence ${Number(scan?.confidence ?? 0).toFixed(2)}<br>
+          Expected ${escapeHtml(productLabel(scan?.expected_product || '-'))}<br>
+          Detected ${escapeHtml(detected || '-')}<br>
+          ${wrong ? `Wrong ${escapeHtml(wrong)}<br>` : ''}
+          ${escapeHtml(scan?.message || '')}
+        </div>
+      </div>
+    </article>`;
+  }).join('');
 }
 function refreshCamera() {
   const img = document.getElementById('cameraFeed');
@@ -279,6 +424,7 @@ async function refresh() {
     setText('seq', s.telemetry?.seq ?? '-');
     for (const [name, active] of Object.entries(s.ir || {})) setIr('ir_' + name, active);
     if (s.latest_scan) renderScan(s.latest_scan);
+    renderMissionScans(s.mission_scans || []);
   } catch (e) {
     setText('event', 'dashboard disconnected');
   }
@@ -304,6 +450,7 @@ class DashboardNode(Node):
         self.latest_ir: dict[str, bool] = {}
         self.latest_telemetry: dict[str, Any] = {}
         self.latest_scan: dict[str, Any] | None = None
+        self.mission_scans: list[dict[str, Any]] = []
         self.telemetry_stamp = 0.0
         self.audit_image_dir = str(self.declare_parameter("audit_image_dir", "~/audix/audit_images").value)
         self.camera_jpeg_quality = int(self.declare_parameter("camera_jpeg_quality", 75).value)
@@ -368,7 +515,7 @@ class DashboardNode(Node):
     def _on_scan_result(self, msg: String) -> None:
         try:
             data = json.loads(msg.data)
-            self.latest_scan = {
+            scan = {
                 "success": bool(data.get("success", False)),
                 "side": int(data.get("side", 0)),
                 "level": int(data.get("level", 0)),
@@ -383,6 +530,8 @@ class DashboardNode(Node):
                 "message": str(data.get("message", "")),
                 "image_path": str(data.get("image_path", "")),
             }
+            self.latest_scan = scan
+            self.mission_scans.append(scan)
         except Exception as exc:
             self.get_logger().warning(f"bad scan result message: {exc}")
 
@@ -427,6 +576,7 @@ class DashboardNode(Node):
             "telemetry": self.latest_telemetry,
             "telemetry_age_s": max(0.0, now - self.telemetry_stamp) if self.telemetry_stamp else None,
             "latest_scan": self.latest_scan,
+            "mission_scans": self.mission_scans,
             "camera_age_s": max(0.0, now - self.camera_stamp) if self.camera_stamp else None,
         }
 
@@ -532,6 +682,10 @@ class DashboardNode(Node):
                         req.shelves = [int(v) for v in data.get("shelves", [])]
                         req.level_1 = bool(data.get("level_1", True))
                         req.level_2 = bool(data.get("level_2", True))
+                        req.shelf_ids = [str(v) for v in data.get("shelf_ids", [])]
+                        req.expected_counts = [max(1, int(v)) for v in data.get("expected_counts", [])]
+                        node.mission_scans = []
+                        node.latest_scan = None
                         res = node._call_sync(node.audit_client, req, 5.0)
                         self._json({"ok": res.accepted, "message": res.message})
                     elif self.path == "/api/stop":
@@ -569,6 +723,7 @@ class DashboardNode(Node):
                     elif self.path == "/api/scan":
                         req = ShelfScan.Request()
                         req.shelf_id = str(data.get("shelf_id", ""))
+                        req.expected_count = max(1, int(data.get("expected_count", 2)))
                         res = node._call_sync(node.scan_client, req, 30.0)
                         scan = node._scan_to_dict(res)
                         node.latest_scan = scan

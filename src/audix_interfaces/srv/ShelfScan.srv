@@ -1,4 +1,5 @@
 string shelf_id
+int32 expected_count
 ---
 bool success
 string shelf_id

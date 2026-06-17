@@ -19,6 +19,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/RotateCommand.srv"
   "srv/SetRobotMode.srv"
   "srv/LiftMoveSteps.srv"
+  "srv/SetTrafficLight.srv"
   "srv/AuditMission.srv"
   "srv/ShelfScan.srv"
   DEPENDENCIES std_msgs
