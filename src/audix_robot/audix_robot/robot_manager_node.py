@@ -46,7 +46,15 @@ FRONT_WATCH_SENSORS = {"front", "front_left", "front_right"}
 SIDE_WATCH_SENSORS = {"left", "right"}
 ALL_WATCH_SENSORS = FRONT_WATCH_SENSORS | SIDE_WATCH_SENSORS
 
-MAP_MOVE_OK_RESULTS = {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "back_falling", "none"}
+MAP_MOVE_OK_RESULTS = {
+    "completed",
+    "front_dynamic_clear",
+    "side_falling",
+    "side_blind_pass",
+    "corner_falling",
+    "back_falling",
+    "none",
+}
 
 
 @dataclass(frozen=True)
@@ -56,21 +64,21 @@ class MapPoint:
 
 
 class AudixStoreMap:
-    WIDTH_CM = 250.0
-    HEIGHT_CM = 200.0
+    WIDTH_CM = 300.0
+    HEIGHT_CM = 210.0
     ROBOT_WIDTH_CM = 30.0
     ROBOT_LENGTH_CM = 40.0
-    SPAWN = MapPoint(15.0, 165.0)
-    TOP_TRAVEL_Y_CM = 165.0
-    AUDIT_Y_CM = 80.0
-    LANE_CENTER_X_CM = {1: 50.0, 2: 200.0}
+    SPAWN = MapPoint(25.0, -29.0)
+    TOP_TRAVEL_Y_CM = -29.0
+    AUDIT_Y_CM = -105.0
+    LANE_CENTER_X_CM = {1: 60.0, 2: 240.0}
     SIDE_NAME = {1: "left shelf side", 2: "right shelf side"}
     SCAN_HEADING_DEG = {1: HEADING_RIGHT_DEG, 2: HEADING_LEFT_DEG}
     FRONT_AVOIDANCE_BIAS = {1: LEFT, 2: RIGHT}
-    SHELF_X_MIN_CM = 105.0
-    SHELF_X_MAX_CM = 145.0
-    SHELF_Y_MIN_CM = 75.0
-    SHELF_Y_MAX_CM = 125.0
+    SHELF_X_MIN_CM = 130.0
+    SHELF_X_MAX_CM = 170.0
+    SHELF_Y_MIN_CM = -130.0
+    SHELF_Y_MAX_CM = -80.0
 
 
 @dataclass
@@ -108,11 +116,12 @@ class MissionArgs:
     front_corner_strafe_distance: float = 0.15
     front_advance_distance: float = 0.20
     front_strafe_search_distance: float = 1.20
-    front_corner_clear_trim_distance: float = 0.02
     front_corner_buffer_distance: float = 0.05
     front_strafe_search_timeout: float = 8.0
     front_corner_buffer_timeout: float = 1.25
     front_advance_timeout: float = 4.0
+    front_side_blind_pass_distance: float = 0.35
+    front_side_blind_pass_timeout: float = 4.0
     side_follow_search_distance: float = 3.00
     side_follow_dry_distance: float = 0.30
     side_follow_watch_front: bool = False
@@ -248,17 +257,25 @@ class RobotManager(Node):
         self.manual_stop_last_s = 0.0
         self.mission_running = False
         self.cancel_mission = threading.Event()
-        self.map_pose = AudixStoreMap.SPAWN
         self.current_audit_side: int | None = None
         self.front_avoidance_bias_override: int | None = None
+        self.front_avoidance_bias_override_reason: str = ""
 
         self.args = MissionArgs(
             goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
             front_dynamic_hold=float(self.declare_parameter("front_dynamic_hold_s", 3.0).value),
+            front_side_blind_pass_distance=float(
+                self.declare_parameter("front_side_blind_pass_distance_m", 0.35).value
+            ),
+            front_side_blind_pass_timeout=float(
+                self.declare_parameter("front_side_blind_pass_timeout_s", 4.0).value
+            ),
             reverse_heading_threshold_deg=float(
                 self.declare_parameter("reverse_heading_threshold_deg", 135.0).value
             ),
         )
+        self._configure_store_map_from_params()
+        self.map_pose = AudixStoreMap.SPAWN
         self.allow_placeholder_audit = bool(self.declare_parameter("allow_placeholder_audit", False).value)
         self.buzzer_hold_s = float(self.declare_parameter("manual_buzzer_hold_s", 1.5).value)
         self.lift_steps = int(self.declare_parameter("audit_lift_steps", 500).value)
@@ -308,6 +325,50 @@ class RobotManager(Node):
         self.create_service(Trigger, "manager/stop", self._handle_manager_stop, callback_group=self.callback_group)
         self.create_timer(0.05, self._manual_safety_tick, callback_group=self.callback_group)
         self.get_logger().info("Robot manager ready")
+
+    def _configure_store_map_from_params(self) -> None:
+        AudixStoreMap.WIDTH_CM = float(self.declare_parameter("map_width_cm", AudixStoreMap.WIDTH_CM).value)
+        AudixStoreMap.HEIGHT_CM = float(self.declare_parameter("map_height_cm", AudixStoreMap.HEIGHT_CM).value)
+        AudixStoreMap.ROBOT_WIDTH_CM = float(
+            self.declare_parameter("map_robot_width_cm", AudixStoreMap.ROBOT_WIDTH_CM).value
+        )
+        AudixStoreMap.ROBOT_LENGTH_CM = float(
+            self.declare_parameter("map_robot_length_cm", AudixStoreMap.ROBOT_LENGTH_CM).value
+        )
+        AudixStoreMap.SPAWN = MapPoint(
+            float(self.declare_parameter("map_spawn_x_cm", AudixStoreMap.SPAWN.x_cm).value),
+            float(self.declare_parameter("map_spawn_y_cm", AudixStoreMap.SPAWN.y_cm).value),
+        )
+        AudixStoreMap.TOP_TRAVEL_Y_CM = float(
+            self.declare_parameter("map_top_travel_y_cm", AudixStoreMap.TOP_TRAVEL_Y_CM).value
+        )
+        AudixStoreMap.AUDIT_Y_CM = float(
+            self.declare_parameter("map_audit_y_cm", AudixStoreMap.AUDIT_Y_CM).value
+        )
+        AudixStoreMap.LANE_CENTER_X_CM = {
+            1: float(self.declare_parameter("map_lane_1_x_cm", AudixStoreMap.LANE_CENTER_X_CM[1]).value),
+            2: float(self.declare_parameter("map_lane_2_x_cm", AudixStoreMap.LANE_CENTER_X_CM[2]).value),
+        }
+        AudixStoreMap.SCAN_HEADING_DEG = {
+            1: float(self.declare_parameter("map_scan_heading_1_deg", AudixStoreMap.SCAN_HEADING_DEG[1]).value),
+            2: float(self.declare_parameter("map_scan_heading_2_deg", AudixStoreMap.SCAN_HEADING_DEG[2]).value),
+        }
+        AudixStoreMap.FRONT_AVOIDANCE_BIAS = {
+            1: int(self.declare_parameter("map_front_avoidance_bias_1", AudixStoreMap.FRONT_AVOIDANCE_BIAS[1]).value),
+            2: int(self.declare_parameter("map_front_avoidance_bias_2", AudixStoreMap.FRONT_AVOIDANCE_BIAS[2]).value),
+        }
+        AudixStoreMap.SHELF_X_MIN_CM = float(
+            self.declare_parameter("map_shelf_x_min_cm", AudixStoreMap.SHELF_X_MIN_CM).value
+        )
+        AudixStoreMap.SHELF_X_MAX_CM = float(
+            self.declare_parameter("map_shelf_x_max_cm", AudixStoreMap.SHELF_X_MAX_CM).value
+        )
+        AudixStoreMap.SHELF_Y_MIN_CM = float(
+            self.declare_parameter("map_shelf_y_min_cm", AudixStoreMap.SHELF_Y_MIN_CM).value
+        )
+        AudixStoreMap.SHELF_Y_MAX_CM = float(
+            self.declare_parameter("map_shelf_y_max_cm", AudixStoreMap.SHELF_Y_MAX_CM).value
+        )
 
     def _on_ir(self, msg: IrState) -> None:
         self.latest_ir = {
@@ -507,24 +568,70 @@ class RobotManager(Node):
         still_front = any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS)
         return still_front, ir_state
 
+    def _current_map_estimate(self) -> MapPoint:
+        if self.latest_telemetry is None:
+            return self.map_pose
+        return MapPoint(
+            AudixStoreMap.SPAWN.x_cm - float(self.pose.world_strafe_cm),
+            AudixStoreMap.SPAWN.y_cm - float(self.pose.world_forward_cm),
+        )
+
+    @staticmethod
+    def _shelf_center() -> MapPoint:
+        return MapPoint(
+            0.5 * (AudixStoreMap.SHELF_X_MIN_CM + AudixStoreMap.SHELF_X_MAX_CM),
+            0.5 * (AudixStoreMap.SHELF_Y_MIN_CM + AudixStoreMap.SHELF_Y_MAX_CM),
+        )
+
     def _active_avoidance_side(self) -> int:
         if self.current_audit_side in AudixStoreMap.LANE_CENTER_X_CM:
             return int(self.current_audit_side)
+        current = self._current_map_estimate()
         return min(
             AudixStoreMap.LANE_CENTER_X_CM,
-            key=lambda side: abs(AudixStoreMap.LANE_CENTER_X_CM[side] - self.map_pose.x_cm),
+            key=lambda side: abs(AudixStoreMap.LANE_CENTER_X_CM[side] - current.x_cm),
         )
 
     def _heading_is_reversed(self) -> bool:
         threshold = min(179.0, max(90.0, float(self.args.reverse_heading_threshold_deg)))
         return abs(wrap_degrees(self.args.heading)) >= threshold
 
-    def _front_avoidance_bias(self) -> tuple[int, int]:
+    @staticmethod
+    def _heading_is_near(heading_deg: float, target_deg: float, tolerance_deg: float = 45.0) -> bool:
+        return abs(wrap_degrees(float(heading_deg) - float(target_deg))) <= float(tolerance_deg)
+
+    def _shelf_aware_bias_for_heading(self, heading_deg: float, side: int) -> tuple[int, str]:
+        current = self._current_map_estimate()
+        shelf = self._shelf_center()
+        heading = wrap_degrees(heading_deg)
+
+        if self._heading_is_near(heading, HEADING_RIGHT_DEG):
+            home_side = current.y_cm >= shelf.y_cm
+            bias = RIGHT if home_side else LEFT
+            side_label = "home side" if home_side else "far side"
+            return bias, f"shelf-aware {side_label}, facing right"
+
+        if self._heading_is_near(heading, HEADING_LEFT_DEG):
+            home_side = current.y_cm >= shelf.y_cm
+            bias = LEFT if home_side else RIGHT
+            side_label = "home side" if home_side else "far side"
+            return bias, f"shelf-aware {side_label}, facing left"
+
+        if current.x_cm < shelf.x_cm:
+            return LEFT, "shelf-aware forward/backward away from shelf from left lane"
+        if current.x_cm > shelf.x_cm:
+            return RIGHT, "shelf-aware forward/backward away from shelf from right lane"
+
+        bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
+        return bias, f"shelf-aware center fallback lane{side}"
+
+    def _front_avoidance_bias(self) -> tuple[int, int, str]:
         side = self._active_avoidance_side()
         if self.front_avoidance_bias_override is not None:
-            return side, self.front_avoidance_bias_override
-        bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
-        return side, bias
+            reason = self.front_avoidance_bias_override_reason or "explicit travel override"
+            return side, self.front_avoidance_bias_override, reason
+        bias, reason = self._shelf_aware_bias_for_heading(self.args.heading, side)
+        return side, bias, reason
 
     def _map_direction_to_body_direction(self, direction: str) -> str:
         direction = direction.upper()
@@ -555,7 +662,7 @@ class RobotManager(Node):
         return label
 
     def _choose_front_avoidance(self, ir_state: dict[str, bool]) -> tuple[int, str]:
-        side, bias = self._front_avoidance_bias()
+        side, bias, bias_reason = self._front_avoidance_bias()
         front = bool(ir_state.get("front", False))
         front_left = bool(ir_state.get("front_left", False))
         front_right = bool(ir_state.get("front_right", False))
@@ -564,12 +671,12 @@ class RobotManager(Node):
                 return self._body_lateral_to_map_direction(RIGHT), "front+front_left"
             if front_right and not front_left:
                 return self._body_lateral_to_map_direction(LEFT), "front+front_right"
-            return bias, f"front lane{side} bias {direction_name(bias)}"
+            return bias, f"front lane{side} {bias_reason} bias {direction_name(bias)}"
         if front_left:
             return self._body_lateral_to_map_direction(RIGHT), "front_left"
         if front_right:
             return self._body_lateral_to_map_direction(LEFT), "front_right"
-        return bias, f"front lane{side} bias {direction_name(bias)}"
+        return bias, f"front lane{side} {bias_reason} bias {direction_name(bias)}"
 
     def _execute_front_search_strafe(self, direction: int, mission: MissionMemory) -> tuple[dict, int, str]:
         for _attempt in range(2):
@@ -595,6 +702,10 @@ class RobotManager(Node):
 
     def _execute_strafe_until_corner_falling(self, direction: int, corner_sensor: str, mission: MissionMemory) -> dict:
         previous_active = bool(self.latest_ir.get(corner_sensor, False))
+        if not previous_active:
+            self._publish_event(f"{corner_sensor} already clear: no extra corner strafe")
+            mission.sync_from_pose(self.pose)
+            return MoveDone(result="corner_falling", heading_deg=self._current_heading_deg(), ir=[corner_sensor]).as_dict()
 
         def stop_predicate():
             body_direction = self._map_lateral_to_body_direction(direction)
@@ -609,18 +720,9 @@ class RobotManager(Node):
             return None
 
         body_direction = self._map_lateral_to_body_direction(direction)
-        strafe_distance = max(
-            0.0,
-            self.args.front_strafe_search_distance - self.args.front_corner_clear_trim_distance,
-        )
-        self._publish_event(
-            "corner clear strafe budget "
-            f"{strafe_distance * 100.0:.1f}cm "
-            f"(trim {self.args.front_corner_clear_trim_distance * 100.0:.1f}cm)"
-        )
         done = self._execute_move_watch(
             direction_to_angle(body_direction),
-            strafe_distance,
+            self.args.front_strafe_search_distance,
             set(),
             self.args.front_strafe_search_timeout,
             label=f"strafe {self._avoidance_direction_label(direction)} until {corner_sensor} falling",
@@ -632,6 +734,8 @@ class RobotManager(Node):
     def _execute_forward_until_side_falling(self, side_sensor: str, mission: MissionMemory) -> dict:
         seen_active = bool(self.latest_ir.get(side_sensor, False))
         previous_active = seen_active
+        if seen_active:
+            self._publish_event(f"{side_sensor} seen at side-follow start")
 
         def stop_predicate():
             nonlocal seen_active, previous_active
@@ -642,20 +746,29 @@ class RobotManager(Node):
             active = bool(self.latest_ir.get(side_sensor, False))
             if active and not seen_active:
                 seen_active = True
+                self._publish_event(f"{side_sensor} seen during side follow")
             if seen_active and previous_active and not active:
+                self._publish_event(f"{side_sensor} falling during side follow")
                 return "side_falling", [side_sensor]
             previous_active = active
             return None
 
         done = self._execute_move_watch(
             0.0,
-            self.args.side_follow_search_distance,
+            self.args.front_side_blind_pass_distance,
             set(),
-            self.args.move_timeout,
-            label=f"forward until {side_sensor} falling",
+            self.args.front_side_blind_pass_timeout,
+            label=f"forward side-follow blind-pass watch {side_sensor}",
             stop_predicate=stop_predicate,
         )
         mission.sync_from_pose(self.pose)
+        if done.get("result") == "completed" and not seen_active:
+            self._publish_event(
+                f"{side_sensor} never seen: use blind pass "
+                f"{self.args.front_side_blind_pass_distance * 100.0:.1f}cm"
+            )
+            done["result"] = "side_blind_pass"
+            done["message"] = "side IR never triggered during blind pass"
         return done
 
     def _execute_lateral_until_back_falling(self, direction: int, mission: MissionMemory) -> dict:
@@ -740,14 +853,22 @@ class RobotManager(Node):
             if abs(offset) <= self.args.rejoin_tolerance:
                 mission.lateral_m = 0.0
                 return last_done
-            direction = RIGHT if offset > 0.0 else LEFT
-            body_direction = self._map_lateral_to_body_direction(direction)
+            path_lateral_heading = wrap_degrees(
+                mission.path_heading_deg + (-90.0 if offset > 0.0 else 90.0)
+            )
+            raw_body_angle = wrap_degrees(path_lateral_heading - self.args.heading)
+            body_direction = LEFT if raw_body_angle > 0.0 else RIGHT
+            body_angle = direction_to_angle(body_direction)
             done = self._execute_segment(
-                direction_to_angle(body_direction),
+                body_angle,
                 abs(offset),
                 {side_sensor_for_direction(body_direction)},
                 mission,
-                label=f"return to center {self._avoidance_direction_label(direction)}",
+                label=(
+                    f"return to path offset {offset * 100.0:.1f}cm "
+                    f"path heading {mission.path_heading_deg:.1f}deg "
+                    f"raw body {raw_body_angle:.1f}deg cardinal {body_angle:.1f}deg"
+                ),
             )
             last_done = done
             if done.get("result") == "ir_stop":
@@ -940,6 +1061,7 @@ class RobotManager(Node):
                 move_timeout_s=move_timeout_s,
                 timeout_returns_done=True,
             )
+            interrupted_by_ir = done.get("result") == "ir_stop"
             if done.get("result") == "ir_stop":
                 done = self._handle_ir_stop(done.get("ir", []), action_budget, mission)
 
@@ -947,7 +1069,7 @@ class RobotManager(Node):
             last_done = done
             if result not in MAP_MOVE_OK_RESULTS:
                 return done
-            if result == "completed":
+            if result == "completed" and not interrupted_by_ir:
                 break
 
             mission.sync_from_pose(self.pose)
@@ -1042,12 +1164,12 @@ class RobotManager(Node):
         )
 
     @staticmethod
-    def _lateral_forward_heading_and_bias(direction: str) -> tuple[float, int]:
+    def _lateral_forward_heading(direction: str) -> float:
         direction = direction.upper()
         if direction == "R":
-            return forward_heading_for_world_direction("R"), RIGHT
+            return forward_heading_for_world_direction("R")
         if direction == "L":
-            return forward_heading_for_world_direction("L"), LEFT
+            return forward_heading_for_world_direction("L")
         raise RuntimeError(f"lateral forward move requires L/R, got {direction}")
 
     def _execute_lateral_as_forward(
@@ -1058,19 +1180,24 @@ class RobotManager(Node):
         label: str,
         bias_note: str,
     ) -> dict:
-        heading_deg, bias = self._lateral_forward_heading_and_bias(direction)
+        heading_deg = self._lateral_forward_heading(direction)
+        side = self._active_avoidance_side()
+        bias, bias_reason = self._shelf_aware_bias_for_heading(heading_deg, side)
         distance_cm = abs(float(distance_cm))
         self._publish_event(
             f"{label}: face {heading_deg:.0f}deg, forward {distance_cm:.1f}cm; "
-            f"front avoidance bias {direction_name(bias)} {bias_note}"
+            f"front avoidance bias {direction_name(bias)} {bias_note}; {bias_reason}"
         )
         previous_bias = self.front_avoidance_bias_override
+        previous_bias_reason = self.front_avoidance_bias_override_reason
         self.front_avoidance_bias_override = bias
+        self.front_avoidance_bias_override_reason = bias_reason
         try:
             self._execute_rotation_to_heading(heading_deg, f"{label} face lateral travel")
             return self._mission_direction_move("F", distance_cm, 0.0)
         finally:
             self.front_avoidance_bias_override = previous_bias
+            self.front_avoidance_bias_override_reason = previous_bias_reason
 
     def _reset_map_pose(self) -> None:
         self.map_pose = AudixStoreMap.SPAWN
@@ -1122,7 +1249,12 @@ class RobotManager(Node):
         result = str(done.get("result", ""))
         if result not in MAP_MOVE_OK_RESULTS:
             raise RuntimeError(f"map lane shift {label} failed: {result or done.get('message', 'unknown')}")
-        self.map_pose = target
+        current = self._current_map_estimate()
+        self.map_pose = MapPoint(target.x_cm, current.y_cm)
+        self._publish_event(
+            "map lane shift odom-y sync "
+            f"{label}: x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
+        )
 
     def _move_map_y(self, target_y_cm: float, label: str) -> None:
         dy = float(target_y_cm) - self.map_pose.y_cm
@@ -1389,7 +1521,7 @@ class RobotManager(Node):
                 response.heading_deg = self._current_heading_deg()
                 return response
 
-        response.ok = done.get("result") in {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "none"}
+        response.ok = done.get("result") in MAP_MOVE_OK_RESULTS
         response.result = str(done.get("result", ""))
         response.message = str(done.get("message", response.result))
         response.forward_cm = float(done.get("forwardCm", 0.0))

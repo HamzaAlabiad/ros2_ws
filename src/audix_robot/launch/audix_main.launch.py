@@ -28,6 +28,24 @@ def generate_launch_description():
     audit_side_1_level_2_shelf_id = LaunchConfiguration("audit_side_1_level_2_shelf_id")
     audit_side_2_level_1_shelf_id = LaunchConfiguration("audit_side_2_level_1_shelf_id")
     audit_side_2_level_2_shelf_id = LaunchConfiguration("audit_side_2_level_2_shelf_id")
+    map_width = LaunchConfiguration("map_width_cm")
+    map_height = LaunchConfiguration("map_height_cm")
+    map_spawn_x = LaunchConfiguration("map_spawn_x_cm")
+    map_spawn_y = LaunchConfiguration("map_spawn_y_cm")
+    map_top_travel_y = LaunchConfiguration("map_top_travel_y_cm")
+    map_audit_y = LaunchConfiguration("map_audit_y_cm")
+    map_lane_1_x = LaunchConfiguration("map_lane_1_x_cm")
+    map_lane_2_x = LaunchConfiguration("map_lane_2_x_cm")
+    map_scan_heading_1 = LaunchConfiguration("map_scan_heading_1_deg")
+    map_scan_heading_2 = LaunchConfiguration("map_scan_heading_2_deg")
+    map_front_avoidance_bias_1 = LaunchConfiguration("map_front_avoidance_bias_1")
+    map_front_avoidance_bias_2 = LaunchConfiguration("map_front_avoidance_bias_2")
+    map_shelf_x_min = LaunchConfiguration("map_shelf_x_min_cm")
+    map_shelf_x_max = LaunchConfiguration("map_shelf_x_max_cm")
+    map_shelf_y_min = LaunchConfiguration("map_shelf_y_min_cm")
+    map_shelf_y_max = LaunchConfiguration("map_shelf_y_max_cm")
+    front_side_blind_pass_distance = LaunchConfiguration("front_side_blind_pass_distance_m")
+    front_side_blind_pass_timeout = LaunchConfiguration("front_side_blind_pass_timeout_s")
 
     return LaunchDescription(
         [
@@ -52,6 +70,24 @@ def generate_launch_description():
             DeclareLaunchArgument("audit_side_1_level_2_shelf_id", default_value="indomie"),
             DeclareLaunchArgument("audit_side_2_level_1_shelf_id", default_value="indomie"),
             DeclareLaunchArgument("audit_side_2_level_2_shelf_id", default_value="fruit_rings_cereal"),
+            DeclareLaunchArgument("map_width_cm", default_value="300.0"),
+            DeclareLaunchArgument("map_height_cm", default_value="210.0"),
+            DeclareLaunchArgument("map_spawn_x_cm", default_value="25.0"),
+            DeclareLaunchArgument("map_spawn_y_cm", default_value="-29.0"),
+            DeclareLaunchArgument("map_top_travel_y_cm", default_value="-29.0"),
+            DeclareLaunchArgument("map_audit_y_cm", default_value="-105.0"),
+            DeclareLaunchArgument("map_lane_1_x_cm", default_value="60.0"),
+            DeclareLaunchArgument("map_lane_2_x_cm", default_value="240.0"),
+            DeclareLaunchArgument("map_scan_heading_1_deg", default_value="-90.0"),
+            DeclareLaunchArgument("map_scan_heading_2_deg", default_value="90.0"),
+            DeclareLaunchArgument("map_front_avoidance_bias_1", default_value="-1"),
+            DeclareLaunchArgument("map_front_avoidance_bias_2", default_value="1"),
+            DeclareLaunchArgument("map_shelf_x_min_cm", default_value="130.0"),
+            DeclareLaunchArgument("map_shelf_x_max_cm", default_value="170.0"),
+            DeclareLaunchArgument("map_shelf_y_min_cm", default_value="-130.0"),
+            DeclareLaunchArgument("map_shelf_y_max_cm", default_value="-80.0"),
+            DeclareLaunchArgument("front_side_blind_pass_distance_m", default_value="0.35"),
+            DeclareLaunchArgument("front_side_blind_pass_timeout_s", default_value="4.0"),
             Node(
                 package="micro_ros_agent",
                 executable="micro_ros_agent",
@@ -105,6 +141,28 @@ def generate_launch_description():
                         "audit_side_1_level_2_shelf_id": audit_side_1_level_2_shelf_id,
                         "audit_side_2_level_1_shelf_id": audit_side_2_level_1_shelf_id,
                         "audit_side_2_level_2_shelf_id": audit_side_2_level_2_shelf_id,
+                        "map_width_cm": ParameterValue(map_width, value_type=float),
+                        "map_height_cm": ParameterValue(map_height, value_type=float),
+                        "map_spawn_x_cm": ParameterValue(map_spawn_x, value_type=float),
+                        "map_spawn_y_cm": ParameterValue(map_spawn_y, value_type=float),
+                        "map_top_travel_y_cm": ParameterValue(map_top_travel_y, value_type=float),
+                        "map_audit_y_cm": ParameterValue(map_audit_y, value_type=float),
+                        "map_lane_1_x_cm": ParameterValue(map_lane_1_x, value_type=float),
+                        "map_lane_2_x_cm": ParameterValue(map_lane_2_x, value_type=float),
+                        "map_scan_heading_1_deg": ParameterValue(map_scan_heading_1, value_type=float),
+                        "map_scan_heading_2_deg": ParameterValue(map_scan_heading_2, value_type=float),
+                        "map_front_avoidance_bias_1": ParameterValue(map_front_avoidance_bias_1, value_type=int),
+                        "map_front_avoidance_bias_2": ParameterValue(map_front_avoidance_bias_2, value_type=int),
+                        "map_shelf_x_min_cm": ParameterValue(map_shelf_x_min, value_type=float),
+                        "map_shelf_x_max_cm": ParameterValue(map_shelf_x_max, value_type=float),
+                        "map_shelf_y_min_cm": ParameterValue(map_shelf_y_min, value_type=float),
+                        "map_shelf_y_max_cm": ParameterValue(map_shelf_y_max, value_type=float),
+                        "front_side_blind_pass_distance_m": ParameterValue(
+                            front_side_blind_pass_distance, value_type=float
+                        ),
+                        "front_side_blind_pass_timeout_s": ParameterValue(
+                            front_side_blind_pass_timeout, value_type=float
+                        ),
                     }
                 ],
             ),
