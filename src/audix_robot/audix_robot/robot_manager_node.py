@@ -21,6 +21,7 @@ from audix_interfaces.srv import (
     SetRobotMode,
     SetTrafficLight,
     ShelfScan,
+    TwistCommand,
 )
 from audix_robot.navigation_contract import (
     DIRECTION_ANGLES_DEG,
@@ -53,6 +54,7 @@ MAP_MOVE_OK_RESULTS = {
     "side_falling",
     "side_blind_pass",
     "corner_falling",
+    "corner_blind_pass",
     "back_falling",
     "none",
 }
@@ -121,6 +123,8 @@ class MissionArgs:
     front_strafe_search_timeout: float = 8.0
     front_corner_buffer_timeout: float = 1.25
     front_advance_timeout: float = 4.0
+    front_corner_blind_pass_distance: float = 0.25
+    front_corner_blind_pass_timeout: float = 4.0
     front_side_blind_pass_distance: float = 0.35
     front_side_blind_pass_timeout: float = 4.0
     side_follow_search_distance: float = 3.00
@@ -249,6 +253,7 @@ class RobotManager(Node):
         self.mode = "manual"
         self.mode_lock = threading.Lock()
         self.motion_lock = threading.Lock()
+        self.manual_motion_lock = threading.Lock()
         self.latest_ir = {name: False for name in IR_SENSOR_ORDER}
         self.latest_telemetry: EspTelemetry | None = None
         self.latest_telemetry_time_s = 0.0
@@ -256,6 +261,8 @@ class RobotManager(Node):
         self.last_event = "ready"
         self.manual_buzzer_until = 0.0
         self.manual_stop_last_s = 0.0
+        self.manual_motion_components: set[str] = set()
+        self.manual_motion_expire_s = 0.0
         self.mission_running = False
         self.cancel_mission = threading.Event()
         self.current_audit_side: int | None = None
@@ -265,6 +272,12 @@ class RobotManager(Node):
         self.args = MissionArgs(
             goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
             front_dynamic_hold=float(self.declare_parameter("front_dynamic_hold_s", 3.0).value),
+            front_corner_blind_pass_distance=float(
+                self.declare_parameter("front_corner_blind_pass_distance_m", 0.25).value
+            ),
+            front_corner_blind_pass_timeout=float(
+                self.declare_parameter("front_corner_blind_pass_timeout_s", 4.0).value
+            ),
             front_side_blind_pass_distance=float(
                 self.declare_parameter("front_side_blind_pass_distance_m", 0.35).value
             ),
@@ -309,6 +322,7 @@ class RobotManager(Node):
         )
 
         self.move_client = self.create_client(Move, "move", callback_group=self.callback_group)
+        self.twist_client = self.create_client(TwistCommand, "twist", callback_group=self.callback_group)
         self.stop_client = self.create_client(Trigger, "esp/stop", callback_group=self.callback_group)
         self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
         self.traffic_light_client = self.create_client(
@@ -326,6 +340,7 @@ class RobotManager(Node):
 
         self.create_service(SetRobotMode, "manager/set_mode", self._handle_set_mode, callback_group=self.callback_group)
         self.create_service(DirectionCommand, "manager/direction_move", self._handle_direction_move, callback_group=self.callback_group)
+        self.create_service(TwistCommand, "manager/twist", self._handle_twist, callback_group=self.callback_group)
         self.create_service(RotateCommand, "manager/rotate", self._handle_rotate, callback_group=self.callback_group)
         self.create_service(AuditMission, "manager/start_audit", self._handle_start_audit, callback_group=self.callback_group)
         self.create_service(Trigger, "manager/go_home", self._handle_go_home, callback_group=self.callback_group)
@@ -442,18 +457,90 @@ class RobotManager(Node):
             mode = self.mode
         if mode != "manual":
             return
-        active = self._active_ir()
         now = time.monotonic()
+        with self.manual_motion_lock:
+            if self.manual_motion_expire_s and now > self.manual_motion_expire_s:
+                self.manual_motion_components = set()
+                self.manual_motion_expire_s = 0.0
+            components = set(self.manual_motion_components)
+        active = self._manual_ir_blockers_for_components(components) if components else []
         if active:
             if now - self.manual_stop_last_s >= 0.5:
                 self._stop_robot()
                 self.manual_stop_last_s = now
-                self._publish_event(f"manual obstacle stop: {active}")
+                self._publish_event(f"manual directional obstacle stop: {active}")
             self.manual_buzzer_until = now + self.buzzer_hold_s
             self._set_buzzer(True)
         elif self.manual_buzzer_until and now >= self.manual_buzzer_until:
             self.manual_buzzer_until = 0.0
             self._set_buzzer(False)
+
+    def _manual_direction_components(self, direction: str) -> set[str]:
+        direction = direction.strip().upper()
+        components: set[str] = set()
+        if "F" in direction:
+            components.add("front")
+        if "B" in direction:
+            components.add("back")
+        if "L" in direction:
+            components.add("left")
+        if "R" in direction:
+            components.add("right")
+        return components
+
+    def _manual_twist_components(self, forward_rpm: float, strafe_rpm: float, turn_rpm: float) -> set[str]:
+        components: set[str] = set()
+        if forward_rpm > 0.001:
+            components.add("front")
+        elif forward_rpm < -0.001:
+            components.add("back")
+        # ESP TWIST strafe is right-positive at the hardware boundary.
+        if strafe_rpm > 0.001:
+            components.add("right")
+        elif strafe_rpm < -0.001:
+            components.add("left")
+        if abs(turn_rpm) > 0.001:
+            components.add("rotate")
+        return components
+
+    def _manual_ir_blockers_for_components(self, components: set[str]) -> list[str]:
+        blocked: set[str] = set()
+        if "rotate" in components:
+            blocked.update(self._active_ir())
+        if "front" in components:
+            blocked.update(self._active_ir(FRONT_WATCH_SENSORS))
+        if "back" in components and self.latest_ir.get("back", False):
+            blocked.add("back")
+        if "left" in components and self.latest_ir.get("left", False):
+            blocked.add("left")
+        if "right" in components and self.latest_ir.get("right", False):
+            blocked.add("right")
+        return sorted(blocked)
+
+    def _set_manual_motion(self, components: set[str], timeout_s: float) -> None:
+        with self.manual_motion_lock:
+            self.manual_motion_components = set(components)
+            self.manual_motion_expire_s = time.monotonic() + max(0.05, float(timeout_s))
+
+    def _clear_manual_motion(self) -> None:
+        with self.manual_motion_lock:
+            self.manual_motion_components = set()
+            self.manual_motion_expire_s = 0.0
+
+    def _reject_blocked_manual_motion(self, response, blockers: list[str], result: str = "manual_ir_blocked"):
+        self._stop_robot()
+        self._clear_manual_motion()
+        self._set_buzzer(True)
+        self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+        message = f"manual direction blocked by IR: {blockers}"
+        self._publish_event(message)
+        response.ok = False
+        if hasattr(response, "result"):
+            response.result = result
+        response.message = message
+        if hasattr(response, "raw_json"):
+            response.raw_json = ""
+        return response
 
     def _send_move_future(self, angle_deg: float, distance_m: float, heading_deg: float, timeout_s: float):
         if not self.move_client.wait_for_service(timeout_sec=max(0.1, min(float(timeout_s), 3.0))):
@@ -701,17 +788,24 @@ class RobotManager(Node):
             watch = {corner_sensor, side_block_sensor}
             done = self._execute_segment(
                 direction_to_angle(body_direction),
-                self.args.front_strafe_search_distance,
+                self.args.front_corner_blind_pass_distance,
                 watch,
                 mission,
                 label=f"front search strafe {self._avoidance_direction_label(direction)}",
-                move_timeout_s=self.args.front_strafe_search_timeout,
+                move_timeout_s=self.args.front_corner_blind_pass_timeout,
                 timeout_returns_done=True,
             )
             active = set(done.get("ir", []))
             if done.get("result") == "ir_stop" and side_block_sensor in active:
                 direction = opposite_direction(direction)
                 continue
+            if done.get("result") == "completed":
+                self._publish_event(
+                    f"{corner_sensor} never seen: use blind pass "
+                    f"{self.args.front_corner_blind_pass_distance * 100.0:.1f}cm"
+                )
+                done["result"] = "corner_blind_pass"
+                done["message"] = "corner IR never triggered during blind pass"
             return done, direction, corner_sensor
         raise RuntimeError("both strafe directions blocked during front avoidance")
 
@@ -890,28 +984,12 @@ class RobotManager(Node):
                 last_done = self._execute_side_path_escape(done.get("ir", []), action_budget, mission)
         raise RuntimeError("could not return to center")
 
-    def _finish_front_avoidance_after_corner(
+    def _execute_corner_side_follow_recenter(
         self,
         direction: int,
-        corner_sensor: str,
         action_budget: list[int],
         mission: MissionMemory,
     ) -> dict:
-        done = self._execute_strafe_until_corner_falling(direction, corner_sensor, mission)
-        if done.get("result") == "ir_stop":
-            body_direction = self._map_lateral_to_body_direction(direction)
-            side_block_sensor = side_sensor_for_direction(body_direction)
-            if side_block_sensor in set(done.get("ir", [])):
-                direction = opposite_direction(direction)
-                self._publish_event(
-                    "front avoidance side blocked: "
-                    f"switch strafe to {self._avoidance_direction_label(direction)}"
-                )
-                done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
-                if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
-                    return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-                return self._finish_front_avoidance_after_corner(direction, corner_sensor, action_budget, mission)
-            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
         body_direction = self._map_lateral_to_body_direction(direction)
         side_sensor = side_sensor_after_front_avoidance(body_direction)
         done = self._execute_forward_until_side_falling(side_sensor, mission)
@@ -929,6 +1007,40 @@ class RobotManager(Node):
         if done.get("result") == "ir_stop":
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
         return self._execute_recenter(action_budget, mission)
+
+    def _finish_front_avoidance_after_corner(
+        self,
+        direction: int,
+        corner_sensor: str,
+        action_budget: list[int],
+        mission: MissionMemory,
+        *,
+        corner_already_cleared: bool = False,
+    ) -> dict:
+        if corner_already_cleared:
+            done = MoveDone(
+                result="corner_blind_pass",
+                message="corner IR never triggered during blind pass",
+                heading_deg=self._current_heading_deg(),
+            ).as_dict()
+            mission.sync_from_pose(self.pose)
+        else:
+            done = self._execute_strafe_until_corner_falling(direction, corner_sensor, mission)
+        if done.get("result") == "ir_stop":
+            body_direction = self._map_lateral_to_body_direction(direction)
+            side_block_sensor = side_sensor_for_direction(body_direction)
+            if side_block_sensor in set(done.get("ir", [])):
+                direction = opposite_direction(direction)
+                self._publish_event(
+                    "front avoidance side blocked: "
+                    f"switch strafe to {self._avoidance_direction_label(direction)}"
+                )
+                done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
+                if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
+                    return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+                return self._finish_front_avoidance_after_corner(direction, corner_sensor, action_budget, mission)
+            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        return self._execute_corner_side_follow_recenter(direction, action_budget, mission)
 
     def _finish_front_clear(self, ir_state: dict[str, bool], action_budget: list[int], mission: MissionMemory) -> dict:
         side_hits = sorted(name for name in SIDE_WATCH_SENSORS if ir_state.get(name, False))
@@ -994,7 +1106,13 @@ class RobotManager(Node):
         done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
         if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-        return self._finish_front_avoidance_after_corner(direction, corner_sensor, action_budget, mission)
+        return self._finish_front_avoidance_after_corner(
+            direction,
+            corner_sensor,
+            action_budget,
+            mission,
+            corner_already_cleared=done.get("result") == "corner_blind_pass",
+        )
 
     def _handle_ir_stop(self, active_sensors: list[str], action_budget: list[int], mission: MissionMemory) -> dict:
         ir_state = {name: False for name in IR_SENSOR_ORDER}
@@ -1520,17 +1638,18 @@ class RobotManager(Node):
                 with self.mode_lock:
                     mode = self.mode
                 if mode == "manual":
-                    active = self._active_ir()
-                    if active:
-                        self._stop_robot()
-                        self._set_buzzer(True)
-                        self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
-                        response.ok = False
-                        response.result = "manual_ir_stop"
-                        response.message = f"manual obstacle stop: {active}"
+                    components = self._manual_direction_components(direction)
+                    blockers = self._manual_ir_blockers_for_components(components)
+                    if blockers:
+                        self._reject_blocked_manual_motion(response, blockers)
+                        response.forward_cm = 0.0
+                        response.strafe_cm = 0.0
+                        response.heading_deg = self._current_heading_deg()
                         return response
                     self._set_traffic_light("yellow")
                     angle = DIRECTION_ANGLES_DEG[direction]
+                    timeout_s = float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout
+                    self._set_manual_motion(components, timeout_s + 0.5)
                     try:
                         done = self._execute_segment(
                             angle,
@@ -1538,10 +1657,11 @@ class RobotManager(Node):
                             set(),
                             None,
                             label=f"manual {direction}",
-                            move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
+                            move_timeout_s=timeout_s,
                             timeout_returns_done=True,
                         )
                     finally:
+                        self._clear_manual_motion()
                         self._set_traffic_light("red")
                 else:
                     done = self._mission_direction_move(direction, float(request.distance_cm), float(request.timeout_s))
@@ -1564,6 +1684,58 @@ class RobotManager(Node):
         response.heading_deg = float(done.get("headingDeg", self._current_heading_deg()))
         return response
 
+    def _handle_twist(
+        self,
+        request: TwistCommand.Request,
+        response: TwistCommand.Response,
+    ) -> TwistCommand.Response:
+        forward_rpm = float(request.forward_rpm)
+        strafe_rpm = float(request.strafe_rpm)
+        turn_rpm = float(request.turn_rpm)
+        moving = any(abs(value) > 0.001 for value in (forward_rpm, strafe_rpm, turn_rpm))
+        components = self._manual_twist_components(forward_rpm, strafe_rpm, turn_rpm)
+
+        with self.motion_lock:
+            try:
+                with self.mode_lock:
+                    mode = self.mode
+                if mode != "manual":
+                    response.ok = False
+                    response.message = "joystick is only available in manual mode"
+                    response.raw_json = ""
+                    return response
+
+                if moving:
+                    blockers = self._manual_ir_blockers_for_components(components)
+                    if blockers:
+                        self._reject_blocked_manual_motion(response, blockers)
+                        return response
+                    self._set_traffic_light("yellow")
+                else:
+                    self._clear_manual_motion()
+                    self._set_traffic_light("red")
+
+                req = TwistCommand.Request()
+                req.forward_rpm = forward_rpm
+                req.strafe_rpm = strafe_rpm
+                req.turn_rpm = turn_rpm
+                req.timeout_s = float(request.timeout_s) if request.timeout_s > 0.0 else 0.3
+                if moving:
+                    self._set_manual_motion(components, req.timeout_s + 0.15)
+                result = self._call_sync(self.twist_client, req, 1.0)
+            except Exception as exc:
+                self.get_logger().error(f"twist failed: {exc}")
+                self._clear_manual_motion()
+                response.ok = False
+                response.message = str(exc)
+                response.raw_json = ""
+                return response
+
+        response.ok = bool(result.ok)
+        response.message = str(result.message)
+        response.raw_json = str(result.raw_json)
+        return response
+
     def _handle_rotate(self, request: RotateCommand.Request, response: RotateCommand.Response) -> RotateCommand.Response:
         direction = request.direction.strip().lower()
         if direction not in {"left", "right", "ccw", "cw"}:
@@ -1576,14 +1748,9 @@ class RobotManager(Node):
 
         with self.motion_lock:
             try:
-                active = self._active_ir() if self.mode == "manual" else []
+                active = self._manual_ir_blockers_for_components({"rotate"}) if self.mode == "manual" else []
                 if active:
-                    self._stop_robot()
-                    self._set_buzzer(True)
-                    self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
-                    response.ok = False
-                    response.result = "manual_ir_stop"
-                    response.message = f"manual obstacle stop: {active}"
+                    self._reject_blocked_manual_motion(response, active)
                     response.heading_deg = self._current_heading_deg()
                     return response
                 self._set_traffic_light("yellow")

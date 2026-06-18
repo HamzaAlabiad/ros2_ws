@@ -20,6 +20,7 @@ from audix_interfaces.srv import (
     RotateCommand,
     SetRobotMode,
     ShelfScan,
+    TwistCommand,
 )
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -76,6 +77,29 @@ INDEX_HTML = r"""<!doctype html>
     input[type=number] { width: 110px; }
     .pad { display: grid; grid-template-columns: repeat(3, 88px); grid-auto-rows: 48px; gap: 8px; }
     .pad button { min-width: 0; }
+    .manual-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 180px; gap: 14px; align-items: start; }
+    .joystick-wrap { display: grid; gap: 8px; justify-items: center; }
+    .joystick {
+      position: relative; width: 160px; height: 160px; border-radius: 50%;
+      border: 1px solid #35506a; background:
+        radial-gradient(circle at center, rgba(115,169,255,0.16), rgba(17,23,30,0.25) 42%, rgba(7,9,12,0.92) 72%),
+        linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.01));
+      touch-action: none; user-select: none; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+    }
+    .joystick::before, .joystick::after {
+      content: ""; position: absolute; background: rgba(115,169,255,0.18); border-radius: 999px;
+    }
+    .joystick::before { left: 18px; right: 18px; top: 50%; height: 1px; }
+    .joystick::after { top: 18px; bottom: 18px; left: 50%; width: 1px; }
+    .stick {
+      position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; border-radius: 50%;
+      transform: translate(-50%, -50%); border: 1px solid #73a9ff;
+      background: radial-gradient(circle at 35% 28%, #d8e7ff, #73a9ff 42%, #1f4c86 100%);
+      box-shadow: 0 10px 28px rgba(31,76,134,0.45);
+      pointer-events: none;
+    }
+    .joystick-state { min-height: 20px; color: var(--muted); font-family: Consolas, monospace; }
+    .joystick-state strong { color: var(--blue); }
     .log { min-height: 110px; max-height: 220px; overflow: auto; color: var(--muted); font-family: Consolas, monospace; white-space: pre-wrap; }
     .ir { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 8px; }
     .pill { border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; color: var(--muted); }
@@ -107,7 +131,7 @@ INDEX_HTML = r"""<!doctype html>
     .image-modal-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--muted); }
     .image-modal img { width: 100%; max-height: 78vh; object-fit: contain; display: block; background: #05070a; }
     label { color: var(--muted); font-size: 13px; }
-    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .audit-row, .vision { grid-template-columns: repeat(1, minmax(0,1fr)); } }
+    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .manual-grid, .audit-row, .vision { grid-template-columns: repeat(1, minmax(0,1fr)); } }
   </style>
 </head>
 <body>
@@ -142,16 +166,24 @@ INDEX_HTML = r"""<!doctype html>
           <button onclick="setMode('manual')">Manual</button>
           <button onclick="setMode('mission')">Mission</button>
         </div>
-        <div class="pad">
-          <button onclick="moveDir('FL')">FL</button>
-          <button onclick="moveDir('F')">F</button>
-          <button onclick="moveDir('FR')">FR</button>
-          <button onclick="moveDir('L')">L</button>
-          <button class="danger" onclick="stopRobot()">STOP</button>
-          <button onclick="moveDir('R')">R</button>
-          <button onclick="moveDir('BL')">BL</button>
-          <button onclick="moveDir('B')">B</button>
-          <button onclick="moveDir('BR')">BR</button>
+        <div class="manual-grid">
+          <div class="pad">
+            <button onclick="moveDir('FL')">FL</button>
+            <button onclick="moveDir('F')">F</button>
+            <button onclick="moveDir('FR')">FR</button>
+            <button onclick="moveDir('L')">L</button>
+            <button class="danger" onclick="stopRobot()">STOP</button>
+            <button onclick="moveDir('R')">R</button>
+            <button onclick="moveDir('BL')">BL</button>
+            <button onclick="moveDir('B')">B</button>
+            <button onclick="moveDir('BR')">BR</button>
+          </div>
+          <div class="joystick-wrap">
+            <div id="joystick" class="joystick" aria-label="manual velocity joystick">
+              <div id="stick" class="stick"></div>
+            </div>
+            <div id="joystickState" class="joystick-state">joystick <strong>idle</strong> · 40 rpm</div>
+          </div>
         </div>
         <div class="row" style="margin-top:10px">
           <label>Rotate deg <input id="rotdeg" type="number" min="1" max="360" step="5" value="90" /></label>
@@ -274,6 +306,12 @@ const PRODUCT_LABELS = {
 let lastSeenEvent = '';
 let lastCameraOk = false;
 let lastMissionScanKey = '';
+const JOYSTICK_RPM = 40;
+const JOYSTICK_TIMEOUT_S = 0.3;
+let joystickPointerId = null;
+let joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
+let joystickTimer = null;
+let joystickBlockedUntilRelease = false;
 function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
@@ -294,6 +332,109 @@ function setMode(mode) { post('/api/mode', {mode}); }
 function trigger(path) { post(path); }
 function buzzer(on) { post('/api/buzzer', {on}); }
 function lift(steps) { post('/api/lift', {steps}); }
+async function sendJoystick(command) {
+  try {
+    const res = await fetch('/api/joystick', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+      forward_rpm: command.forward_rpm,
+      strafe_rpm: command.strafe_rpm,
+      turn_rpm: 0,
+      timeout_s: JOYSTICK_TIMEOUT_S
+      })
+    });
+    const data = await res.json();
+    if (!data.ok && command.label !== 'idle') {
+      log(`joystick rejected: ${data.message}`);
+      cancelJoystickUntilRelease('blocked');
+    }
+  } catch (e) {
+    log(`joystick failed: ${e}`);
+  }
+}
+async function sendJoystickStop() {
+  try {
+    await fetch('/api/joystick', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({forward_rpm: 0, strafe_rpm: 0, turn_rpm: 0, timeout_s: JOYSTICK_TIMEOUT_S})
+    });
+  } catch (e) {
+    log(`joystick stop failed: ${e}`);
+  }
+}
+function setJoystickState(label) {
+  document.getElementById('joystickState').innerHTML = `joystick <strong>${escapeHtml(label)}</strong> · ${JOYSTICK_RPM} rpm`;
+}
+function moveStick(dx, dy) {
+  document.getElementById('stick').style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+}
+function joystickFromPoint(event) {
+  const pad = document.getElementById('joystick');
+  const rect = pad.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  let dx = event.clientX - cx;
+  let dy = event.clientY - cy;
+  const max = rect.width * 0.31;
+  const mag = Math.hypot(dx, dy);
+  if (mag > max) {
+    dx = dx / mag * max;
+    dy = dy / mag * max;
+  }
+  moveStick(dx, dy);
+  const deadzone = rect.width * 0.10;
+  if (Math.hypot(dx, dy) < deadzone) {
+    return {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
+  }
+  const forward = dy < -deadzone ? JOYSTICK_RPM : dy > deadzone ? -JOYSTICK_RPM : 0;
+  const strafe = dx < -deadzone ? -JOYSTICK_RPM : dx > deadzone ? JOYSTICK_RPM : 0;
+  const parts = [];
+  if (forward > 0) parts.push('F');
+  if (forward < 0) parts.push('B');
+  if (strafe < 0) parts.push('L');
+  if (strafe > 0) parts.push('R');
+  return {forward_rpm: forward, strafe_rpm: strafe, label: parts.join('') || 'idle'};
+}
+function cancelJoystickUntilRelease(label) {
+  clearInterval(joystickTimer);
+  joystickTimer = null;
+  joystickPointerId = null;
+  joystickBlockedUntilRelease = true;
+  joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
+  moveStick(0, 0);
+  setJoystickState(`${label} - release`);
+  sendJoystickStop();
+}
+function startJoystick(event) {
+  event.preventDefault();
+  joystickBlockedUntilRelease = false;
+  const pad = document.getElementById('joystick');
+  joystickPointerId = event.pointerId;
+  pad.setPointerCapture(joystickPointerId);
+  joystickCommand = joystickFromPoint(event);
+  setJoystickState(joystickCommand.label);
+  sendJoystick(joystickCommand);
+  clearInterval(joystickTimer);
+  joystickTimer = setInterval(() => sendJoystick(joystickCommand), 100);
+}
+function updateJoystick(event) {
+  if (joystickBlockedUntilRelease || joystickPointerId !== event.pointerId) return;
+  event.preventDefault();
+  joystickCommand = joystickFromPoint(event);
+  setJoystickState(joystickCommand.label);
+}
+function stopJoystick() {
+  clearInterval(joystickTimer);
+  joystickTimer = null;
+  joystickPointerId = null;
+  joystickBlockedUntilRelease = false;
+  joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
+  moveStick(0, 0);
+  setJoystickState('idle');
+  sendJoystick(joystickCommand);
+}
 function productLabel(value) {
   const raw = String(value ?? '');
   return PRODUCT_LABELS[raw] || raw.replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
@@ -431,6 +572,12 @@ async function refresh() {
 }
 setInterval(refresh, 250);
 setInterval(refreshCamera, 300);
+document.getElementById('joystick').addEventListener('pointerdown', startJoystick);
+document.getElementById('joystick').addEventListener('pointermove', updateJoystick);
+document.getElementById('joystick').addEventListener('pointerup', stopJoystick);
+document.getElementById('joystick').addEventListener('pointercancel', stopJoystick);
+document.getElementById('joystick').addEventListener('lostpointercapture', stopJoystick);
+window.addEventListener('blur', stopJoystick);
 refresh();
 refreshCamera();
 </script>
@@ -462,6 +609,7 @@ class DashboardNode(Node):
         self.last_camera_encode_s = 0.0
 
         self.direction_client = self.create_client(DirectionCommand, "manager/direction_move", callback_group=self.callback_group)
+        self.twist_client = self.create_client(TwistCommand, "manager/twist", callback_group=self.callback_group)
         self.rotate_client = self.create_client(RotateCommand, "manager/rotate", callback_group=self.callback_group)
         self.mode_client = self.create_client(SetRobotMode, "manager/set_mode", callback_group=self.callback_group)
         self.audit_client = self.create_client(AuditMission, "manager/start_audit", callback_group=self.callback_group)
@@ -663,6 +811,14 @@ class DashboardNode(Node):
                         req.timeout_s = float(data.get("timeout_s", 0.0))
                         res = node._call_sync(node.direction_client, req, 200.0)
                         self._json({"ok": res.ok, "result": res.result, "message": res.message})
+                    elif self.path == "/api/joystick":
+                        req = TwistCommand.Request()
+                        req.forward_rpm = float(data.get("forward_rpm", 0.0))
+                        req.strafe_rpm = float(data.get("strafe_rpm", 0.0))
+                        req.turn_rpm = float(data.get("turn_rpm", 0.0))
+                        req.timeout_s = float(data.get("timeout_s", 0.3))
+                        res = node._call_sync(node.twist_client, req, 2.0)
+                        self._json({"ok": res.ok, "message": res.message, "raw_json": res.raw_json})
                     elif self.path == "/api/rotate":
                         req = RotateCommand.Request()
                         req.direction = str(data.get("direction", ""))

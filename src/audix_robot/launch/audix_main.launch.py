@@ -47,6 +47,8 @@ def generate_launch_description():
     map_shelf_x_max = LaunchConfiguration("map_shelf_x_max_cm")
     map_shelf_y_min = LaunchConfiguration("map_shelf_y_min_cm")
     map_shelf_y_max = LaunchConfiguration("map_shelf_y_max_cm")
+    front_corner_blind_pass_distance = LaunchConfiguration("front_corner_blind_pass_distance_m")
+    front_corner_blind_pass_timeout = LaunchConfiguration("front_corner_blind_pass_timeout_s")
     front_side_blind_pass_distance = LaunchConfiguration("front_side_blind_pass_distance_m")
     front_side_blind_pass_timeout = LaunchConfiguration("front_side_blind_pass_timeout_s")
 
@@ -92,6 +94,8 @@ def generate_launch_description():
             DeclareLaunchArgument("map_shelf_x_max_cm", default_value="170.0"),
             DeclareLaunchArgument("map_shelf_y_min_cm", default_value="-130.0"),
             DeclareLaunchArgument("map_shelf_y_max_cm", default_value="-80.0"),
+            DeclareLaunchArgument("front_corner_blind_pass_distance_m", default_value="0.25"),
+            DeclareLaunchArgument("front_corner_blind_pass_timeout_s", default_value="4.0"),
             DeclareLaunchArgument("front_side_blind_pass_distance_m", default_value="0.35"),
             DeclareLaunchArgument("front_side_blind_pass_timeout_s", default_value="4.0"),
             Node(
@@ -169,6 +173,12 @@ def generate_launch_description():
                         "map_shelf_x_max_cm": ParameterValue(map_shelf_x_max, value_type=float),
                         "map_shelf_y_min_cm": ParameterValue(map_shelf_y_min, value_type=float),
                         "map_shelf_y_max_cm": ParameterValue(map_shelf_y_max, value_type=float),
+                        "front_corner_blind_pass_distance_m": ParameterValue(
+                            front_corner_blind_pass_distance, value_type=float
+                        ),
+                        "front_corner_blind_pass_timeout_s": ParameterValue(
+                            front_corner_blind_pass_timeout, value_type=float
+                        ),
                         "front_side_blind_pass_distance_m": ParameterValue(
                             front_side_blind_pass_distance, value_type=float
                         ),
