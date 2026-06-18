@@ -261,12 +261,14 @@ class RobotManager(Node):
         self.mode_lock = threading.Lock()
         self.motion_lock = threading.Lock()
         self.manual_motion_lock = threading.Lock()
+        self.buzzer_lock = threading.Lock()
         self.latest_ir = {name: False for name in IR_SENSOR_ORDER}
         self.latest_telemetry: EspTelemetry | None = None
         self.latest_telemetry_time_s = 0.0
         self.pose = PoseAccumulator()
         self.last_event = "ready"
         self.manual_buzzer_until = 0.0
+        self.buzzer_commanded_state: bool | None = None
         self.manual_stop_last_s = 0.0
         self.manual_motion_components: set[str] = set()
         self.manual_motion_expire_s = 0.0
@@ -411,6 +413,7 @@ class RobotManager(Node):
             "back": bool(msg.back),
             "left": bool(msg.left),
         }
+        self._sync_buzzer_state()
 
     def _on_telemetry(self, msg: EspTelemetry) -> None:
         self.latest_telemetry = msg
@@ -440,12 +443,26 @@ class RobotManager(Node):
             raise TimeoutError(f"timed out waiting for {client.srv_name}")
         return holder["future"].result()
 
+    def _buzzer_desired_state(self, requested: bool) -> bool:
+        manual_hold_active = bool(self.manual_buzzer_until and time.monotonic() < self.manual_buzzer_until)
+        return bool(requested) or any(self.latest_ir.values()) or manual_hold_active
+
+    def _sync_buzzer_state(self) -> None:
+        self._set_buzzer(False)
+
     def _set_buzzer(self, enabled: bool) -> None:
+        desired = self._buzzer_desired_state(bool(enabled))
+        with self.buzzer_lock:
+            if self.buzzer_commanded_state == desired:
+                return
+            self.buzzer_commanded_state = desired
         try:
             req = SetBool.Request()
-            req.data = bool(enabled)
+            req.data = desired
             self._call_sync(self.buzzer_client, req, 1.0)
         except Exception as exc:
+            with self.buzzer_lock:
+                self.buzzer_commanded_state = None
             self.get_logger().warning(f"buzzer request failed: {exc}")
 
     def _set_traffic_light(self, state: str) -> None:
