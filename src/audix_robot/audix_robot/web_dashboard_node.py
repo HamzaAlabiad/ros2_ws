@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Headless web dashboard for Audix control and monitoring."""
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from audix_interfaces.srv import (
     RotateCommand,
     SetRobotMode,
     ShelfScan,
-    TwistCommand,
 )
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -77,41 +76,22 @@ INDEX_HTML = r"""<!doctype html>
     input[type=number] { width: 110px; }
     .pad { display: grid; grid-template-columns: repeat(3, 88px); grid-auto-rows: 48px; gap: 8px; }
     .pad button { min-width: 0; }
-    .manual-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 180px; gap: 14px; align-items: start; }
-    .joystick-wrap { display: grid; gap: 8px; justify-items: center; }
-    .joystick {
-      position: relative; width: 160px; height: 160px; border-radius: 50%;
-      border: 1px solid #35506a; background:
-        radial-gradient(circle at center, rgba(115,169,255,0.16), rgba(17,23,30,0.25) 42%, rgba(7,9,12,0.92) 72%),
-        linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.01));
-      touch-action: none; user-select: none; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
-    }
-    .joystick::before, .joystick::after {
-      content: ""; position: absolute; background: rgba(115,169,255,0.18); border-radius: 999px;
-    }
-    .joystick::before { left: 18px; right: 18px; top: 50%; height: 1px; }
-    .joystick::after { top: 18px; bottom: 18px; left: 50%; width: 1px; }
-    .stick {
-      position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; border-radius: 50%;
-      transform: translate(-50%, -50%); border: 1px solid #73a9ff;
-      background: radial-gradient(circle at 35% 28%, #d8e7ff, #73a9ff 42%, #1f4c86 100%);
-      box-shadow: 0 10px 28px rgba(31,76,134,0.45);
-      pointer-events: none;
-    }
-    .joystick-state { min-height: 20px; color: var(--muted); font-family: Consolas, monospace; }
-    .joystick-state strong { color: var(--blue); }
+    .manual-grid { display: grid; grid-template-columns: minmax(260px, max-content); gap: 14px; align-items: start; }
     .log { min-height: 110px; max-height: 220px; overflow: auto; color: var(--muted); font-family: Consolas, monospace; white-space: pre-wrap; }
     .ir { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 8px; }
     .pill { border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; color: var(--muted); }
     .pill.on { color: white; background: #4a1c22; border-color: var(--danger); }
     .audit-rows { display: grid; gap: 8px; }
     .audit-row {
-      display: grid; grid-template-columns: minmax(120px, 1fr) minmax(190px, 1.3fr) 120px;
+      display: grid; grid-template-columns: 46px minmax(110px, 0.8fr) minmax(190px, 1.2fr) 120px 86px;
       gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
       background: #111820;
     }
     .audit-row label { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
     .audit-row select, .audit-row input { width: 100%; }
+    .step-index { color: var(--muted); font-family: Consolas, monospace; }
+    .audit-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .audit-empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; }
     .vision { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; margin-top: 10px; }
     .camera-feed { width: 100%; max-height: 320px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; background: #07090c; margin-bottom: 10px; }
     .scan-image { display: none; width: 100%; max-height: 260px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; background: #07090c; }
@@ -178,12 +158,6 @@ INDEX_HTML = r"""<!doctype html>
             <button onclick="moveDir('B')">B</button>
             <button onclick="moveDir('BR')">BR</button>
           </div>
-          <div class="joystick-wrap">
-            <div id="joystick" class="joystick" aria-label="manual velocity joystick">
-              <div id="stick" class="stick"></div>
-            </div>
-            <div id="joystickState" class="joystick-state">joystick <strong>idle</strong> · 40 rpm</div>
-          </div>
         </div>
         <div class="row" style="margin-top:10px">
           <label>Rotate deg <input id="rotdeg" type="number" min="1" max="360" step="5" value="90" /></label>
@@ -215,27 +189,10 @@ INDEX_HTML = r"""<!doctype html>
     <section class="wide">
       <h2>Mission Audit</h2>
       <div class="panel">
-        <div class="audit-rows">
-          <div class="audit-row" data-lane="1">
-            <label><input type="checkbox" id="lane1Enabled" class="side" value="1" checked /> Lane 1 side</label>
-            <select id="lane1Product">
-              <option value="indomie" selected>Indomie</option>
-              <option value="fruit_rings_cereal">Fruit Rings Cereal</option>
-              <option value="beans_can">Beans Can</option>
-            </select>
-            <label>Quantity <input id="lane1Qty" type="number" min="1" max="20" step="1" value="2" /></label>
-          </div>
-          <div class="audit-row" data-lane="2">
-            <label><input type="checkbox" id="lane2Enabled" class="side" value="2" /> Lane 2 side</label>
-            <select id="lane2Product">
-              <option value="indomie">Indomie</option>
-              <option value="fruit_rings_cereal" selected>Fruit Rings Cereal</option>
-              <option value="beans_can">Beans Can</option>
-            </select>
-            <label>Quantity <input id="lane2Qty" type="number" min="1" max="20" step="1" value="2" /></label>
-          </div>
-        </div>
-        <div class="row" style="margin-top:10px">
+        <div id="missionSteps" class="audit-rows"></div>
+        <div class="audit-actions">
+          <button id="addLane1" onclick="addMissionStep(1)">Add Lane 1</button>
+          <button id="addLane2" onclick="addMissionStep(2)">Add Lane 2</button>
           <button class="accent" onclick="startAudit()">Start Audit</button>
           <button class="warn" onclick="lift(500)">Jog +500</button>
           <button class="warn" onclick="lift(-500)">Jog -500</button>
@@ -306,134 +263,50 @@ const PRODUCT_LABELS = {
 let lastSeenEvent = '';
 let lastCameraOk = false;
 let lastMissionScanKey = '';
-const JOYSTICK_RPM = 40;
-const JOYSTICK_TIMEOUT_S = 0.3;
-let joystickPointerId = null;
-let joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
-let joystickTimer = null;
-let joystickBlockedUntilRelease = false;
+let missionSteps = [{side: 1, shelf_id: 'indomie', expected_count: 2}];
 function log(msg) {
-  const t = new Date().toLocaleTimeString();
-  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+  const stamp = new Date().toLocaleTimeString();
+  logEl.textContent = `[${stamp}] ${msg}\n` + logEl.textContent;
 }
-async function post(path, body={}) {
-  const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  const data = await res.json();
+async function post(path, body = {}) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await response.json();
   log(`${path}: ${JSON.stringify(data)}`);
   return data;
 }
-function dist() { return Number(document.getElementById('dist').value || 0); }
-function rotdeg() { return Number(document.getElementById('rotdeg').value || 0); }
-function moveDir(direction) { post('/api/move', {direction, distance_cm: dist()}); }
-function rotate(direction) { post('/api/rotate', {direction, degrees: rotdeg()}); }
-function stopRobot() { post('/api/stop'); }
-function homeRobot() { post('/api/home'); }
-function setMode(mode) { post('/api/mode', {mode}); }
-function trigger(path) { post(path); }
-function buzzer(on) { post('/api/buzzer', {on}); }
-function lift(steps) { post('/api/lift', {steps}); }
-async function sendJoystick(command) {
-  try {
-    const res = await fetch('/api/joystick', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-      forward_rpm: command.forward_rpm,
-      strafe_rpm: command.strafe_rpm,
-      turn_rpm: 0,
-      timeout_s: JOYSTICK_TIMEOUT_S
-      })
-    });
-    const data = await res.json();
-    if (!data.ok && command.label !== 'idle') {
-      log(`joystick rejected: ${data.message}`);
-      cancelJoystickUntilRelease('blocked');
-    }
-  } catch (e) {
-    log(`joystick failed: ${e}`);
-  }
+function dist() {
+  return Number(document.getElementById('dist').value || 0);
 }
-async function sendJoystickStop() {
-  try {
-    await fetch('/api/joystick', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({forward_rpm: 0, strafe_rpm: 0, turn_rpm: 0, timeout_s: JOYSTICK_TIMEOUT_S})
-    });
-  } catch (e) {
-    log(`joystick stop failed: ${e}`);
-  }
+function rotdeg() {
+  return Number(document.getElementById('rotdeg').value || 0);
 }
-function setJoystickState(label) {
-  document.getElementById('joystickState').innerHTML = `joystick <strong>${escapeHtml(label)}</strong> · ${JOYSTICK_RPM} rpm`;
+function moveDir(direction) {
+  post('/api/move', {direction, distance_cm: dist()});
 }
-function moveStick(dx, dy) {
-  document.getElementById('stick').style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+function rotate(direction) {
+  post('/api/rotate', {direction, degrees: rotdeg()});
 }
-function joystickFromPoint(event) {
-  const pad = document.getElementById('joystick');
-  const rect = pad.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height / 2;
-  let dx = event.clientX - cx;
-  let dy = event.clientY - cy;
-  const max = rect.width * 0.31;
-  const mag = Math.hypot(dx, dy);
-  if (mag > max) {
-    dx = dx / mag * max;
-    dy = dy / mag * max;
-  }
-  moveStick(dx, dy);
-  const deadzone = rect.width * 0.10;
-  if (Math.hypot(dx, dy) < deadzone) {
-    return {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
-  }
-  const forward = dy < -deadzone ? JOYSTICK_RPM : dy > deadzone ? -JOYSTICK_RPM : 0;
-  const strafe = dx < -deadzone ? -JOYSTICK_RPM : dx > deadzone ? JOYSTICK_RPM : 0;
-  const parts = [];
-  if (forward > 0) parts.push('F');
-  if (forward < 0) parts.push('B');
-  if (strafe < 0) parts.push('L');
-  if (strafe > 0) parts.push('R');
-  return {forward_rpm: forward, strafe_rpm: strafe, label: parts.join('') || 'idle'};
+function stopRobot() {
+  post('/api/stop');
 }
-function cancelJoystickUntilRelease(label) {
-  clearInterval(joystickTimer);
-  joystickTimer = null;
-  joystickPointerId = null;
-  joystickBlockedUntilRelease = true;
-  joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
-  moveStick(0, 0);
-  setJoystickState(`${label} - release`);
-  sendJoystickStop();
+function homeRobot() {
+  post('/api/home');
 }
-function startJoystick(event) {
-  event.preventDefault();
-  joystickBlockedUntilRelease = false;
-  const pad = document.getElementById('joystick');
-  joystickPointerId = event.pointerId;
-  pad.setPointerCapture(joystickPointerId);
-  joystickCommand = joystickFromPoint(event);
-  setJoystickState(joystickCommand.label);
-  sendJoystick(joystickCommand);
-  clearInterval(joystickTimer);
-  joystickTimer = setInterval(() => sendJoystick(joystickCommand), 100);
+function setMode(mode) {
+  post('/api/mode', {mode});
 }
-function updateJoystick(event) {
-  if (joystickBlockedUntilRelease || joystickPointerId !== event.pointerId) return;
-  event.preventDefault();
-  joystickCommand = joystickFromPoint(event);
-  setJoystickState(joystickCommand.label);
+function trigger(path) {
+  post(path);
 }
-function stopJoystick() {
-  clearInterval(joystickTimer);
-  joystickTimer = null;
-  joystickPointerId = null;
-  joystickBlockedUntilRelease = false;
-  joystickCommand = {forward_rpm: 0, strafe_rpm: 0, label: 'idle'};
-  moveStick(0, 0);
-  setJoystickState('idle');
-  sendJoystick(joystickCommand);
+function buzzer(on) {
+  post('/api/buzzer', {on});
+}
+function lift(steps) {
+  post('/api/lift', {steps});
 }
 function productLabel(value) {
   const raw = String(value ?? '');
@@ -442,6 +315,79 @@ function productLabel(value) {
 function cleanList(values) {
   return (values || []).map(productLabel).join(', ');
 }
+function productOptions(selected) {
+  return Object.entries({
+    indomie: 'Indomie',
+    fruit_rings_cereal: 'Fruit Rings Cereal',
+    beans_can: 'Beans Can'
+  }).map(([value, label]) => `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`).join('');
+}
+function defaultProductForLane(side) {
+  return Number(side) === 2 ? 'fruit_rings_cereal' : 'indomie';
+}
+function updateAddLaneButtons() {
+  const last = missionSteps.length ? missionSteps[missionSteps.length - 1].side : null;
+  document.getElementById('addLane1').disabled = last === 1;
+  document.getElementById('addLane2').disabled = last === 2;
+}
+function renderMissionSteps() {
+  const root = document.getElementById('missionSteps');
+  if (!missionSteps.length) {
+    root.innerHTML = '<div class="audit-empty">Add at least one mission step.</div>';
+    updateAddLaneButtons();
+    return;
+  }
+  root.innerHTML = missionSteps.map((step, index) => `
+    <div class="audit-row">
+      <div class="step-index">#${index + 1}</div>
+      <select onchange="updateMissionStep(${index}, 'side', Number(this.value))">
+        <option value="1" ${step.side === 1 ? 'selected' : ''}>Lane 1</option>
+        <option value="2" ${step.side === 2 ? 'selected' : ''}>Lane 2</option>
+      </select>
+      <select onchange="updateMissionStep(${index}, 'shelf_id', this.value)">
+        ${productOptions(step.shelf_id)}
+      </select>
+      <label>Qty <input type="number" min="1" max="20" step="1" value="${step.expected_count}" onchange="updateMissionStep(${index}, 'expected_count', Number(this.value || 1))" /></label>
+      <button onclick="removeMissionStep(${index})">Remove</button>
+    </div>
+  `).join('');
+  updateAddLaneButtons();
+}
+function hasAdjacentDuplicateSteps(steps) {
+  return steps.some((step, index) => index > 0 && step.side === steps[index - 1].side);
+}
+function addMissionStep(side) {
+  side = Number(side);
+  if (missionSteps.length && missionSteps[missionSteps.length - 1].side === side) {
+    log(`mission builder: lane ${side} cannot be added twice in a row`);
+    return;
+  }
+  missionSteps.push({side, shelf_id: defaultProductForLane(side), expected_count: 2});
+  renderMissionSteps();
+}
+function removeMissionStep(index) {
+  missionSteps.splice(index, 1);
+  renderMissionSteps();
+}
+function updateMissionStep(index, key, value) {
+  if (!missionSteps[index]) return;
+  const next = missionSteps.map(step => ({...step}));
+  if (key === 'side') {
+    next[index].side = Number(value);
+    if (hasAdjacentDuplicateSteps(next)) {
+      log('mission builder: same lane cannot be selected twice in a row');
+      renderMissionSteps();
+      return;
+    }
+    if (!next[index].shelf_id) next[index].shelf_id = defaultProductForLane(next[index].side);
+  } else if (key === 'expected_count') {
+    next[index].expected_count = Math.max(1, Number(value || 1));
+  } else {
+    next[index][key] = value;
+  }
+  missionSteps = next;
+  renderMissionSteps();
+}
 async function scanShelf() {
   const shelf_id = document.getElementById('scanShelf').value;
   const expected_count = Math.max(1, Number(document.getElementById('scanQty').value || 2));
@@ -449,15 +395,17 @@ async function scanShelf() {
   if (data.scan) renderScan(data.scan);
 }
 function startAudit() {
-  const shelves = [];
-  const shelf_ids = [];
-  const expected_counts = [];
-  for (const side of [1, 2]) {
-    if (!document.getElementById(`lane${side}Enabled`).checked) continue;
-    shelves.push(side);
-    shelf_ids.push(document.getElementById(`lane${side}Product`).value);
-    expected_counts.push(Math.max(1, Number(document.getElementById(`lane${side}Qty`).value || 2)));
+  if (!missionSteps.length) {
+    log('mission builder: add at least one mission step');
+    return;
   }
+  if (hasAdjacentDuplicateSteps(missionSteps)) {
+    log('mission builder: same lane cannot appear twice in a row');
+    return;
+  }
+  const shelves = missionSteps.map(step => Number(step.side));
+  const shelf_ids = missionSteps.map(step => step.shelf_id);
+  const expected_counts = missionSteps.map(step => Math.max(1, Number(step.expected_count || 1)));
   post('/api/audit', {shelves, shelf_ids, expected_counts, level_1: true, level_2: false});
 }
 function setText(id, value) { document.getElementById(id).textContent = value; }
@@ -572,12 +520,7 @@ async function refresh() {
 }
 setInterval(refresh, 250);
 setInterval(refreshCamera, 300);
-document.getElementById('joystick').addEventListener('pointerdown', startJoystick);
-document.getElementById('joystick').addEventListener('pointermove', updateJoystick);
-document.getElementById('joystick').addEventListener('pointerup', stopJoystick);
-document.getElementById('joystick').addEventListener('pointercancel', stopJoystick);
-document.getElementById('joystick').addEventListener('lostpointercapture', stopJoystick);
-window.addEventListener('blur', stopJoystick);
+renderMissionSteps();
 refresh();
 refreshCamera();
 </script>
@@ -609,7 +552,6 @@ class DashboardNode(Node):
         self.last_camera_encode_s = 0.0
 
         self.direction_client = self.create_client(DirectionCommand, "manager/direction_move", callback_group=self.callback_group)
-        self.twist_client = self.create_client(TwistCommand, "manager/twist", callback_group=self.callback_group)
         self.rotate_client = self.create_client(RotateCommand, "manager/rotate", callback_group=self.callback_group)
         self.mode_client = self.create_client(SetRobotMode, "manager/set_mode", callback_group=self.callback_group)
         self.audit_client = self.create_client(AuditMission, "manager/start_audit", callback_group=self.callback_group)
@@ -811,14 +753,6 @@ class DashboardNode(Node):
                         req.timeout_s = float(data.get("timeout_s", 0.0))
                         res = node._call_sync(node.direction_client, req, 200.0)
                         self._json({"ok": res.ok, "result": res.result, "message": res.message})
-                    elif self.path == "/api/joystick":
-                        req = TwistCommand.Request()
-                        req.forward_rpm = float(data.get("forward_rpm", 0.0))
-                        req.strafe_rpm = float(data.get("strafe_rpm", 0.0))
-                        req.turn_rpm = float(data.get("turn_rpm", 0.0))
-                        req.timeout_s = float(data.get("timeout_s", 0.3))
-                        res = node._call_sync(node.twist_client, req, 2.0)
-                        self._json({"ok": res.ok, "message": res.message, "raw_json": res.raw_json})
                     elif self.path == "/api/rotate":
                         req = RotateCommand.Request()
                         req.direction = str(data.get("direction", ""))

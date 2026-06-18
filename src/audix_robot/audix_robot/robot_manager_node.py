@@ -66,6 +66,13 @@ class MapPoint:
     y_cm: float
 
 
+@dataclass(frozen=True)
+class AuditStep:
+    side: int
+    shelf_id: str
+    expected_count: int
+
+
 class AudixStoreMap:
     WIDTH_CM = 300.0
     HEIGHT_CM = 210.0
@@ -296,6 +303,9 @@ class RobotManager(Node):
         self.lift_speed_sps = float(self.declare_parameter("lift_speed_sps", 500.0).value)
         self.scan_timeout_s = float(self.declare_parameter("vision_scan_timeout_s", 25.0).value)
         self.scan_settle_s = float(self.declare_parameter("vision_scan_settle_s", 0.5).value)
+        self.scan_setpoint_tolerance_cm = float(
+            self.declare_parameter("scan_setpoint_tolerance_cm", 2.0).value
+        )
         self.home_tolerance_cm = float(self.declare_parameter("home_tolerance_cm", 2.0).value)
         self.home_max_passes = int(self.declare_parameter("home_max_passes", 12).value)
         self.home_settle_s = float(self.declare_parameter("home_settle_s", 0.25).value)
@@ -1416,6 +1426,52 @@ class RobotManager(Node):
         self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} audit row face forward")
         self._move_map_y(AudixStoreMap.AUDIT_Y_CM, f"{side_name} audit row")
 
+    def _polish_scan_setpoint(self, side: int) -> None:
+        self._raise_if_cancelled()
+        target = MapPoint(AudixStoreMap.LANE_CENTER_X_CM[side], AudixStoreMap.AUDIT_Y_CM)
+        side_name = AudixStoreMap.SIDE_NAME[side]
+        tolerance_cm = max(0.5, float(self.scan_setpoint_tolerance_cm))
+        self._wait_for_telemetry(timeout_s=2.0)
+        current = self._current_map_estimate()
+        error_x_cm = target.x_cm - current.x_cm
+        error_y_cm = target.y_cm - current.y_cm
+        self._publish_event(
+            f"{side_name} scan setpoint check: "
+            f"map_error_x={error_x_cm:.1f}cm map_error_y={error_y_cm:.1f}cm"
+        )
+        if abs(error_x_cm) <= tolerance_cm and abs(error_y_cm) <= tolerance_cm:
+            self.map_pose = target
+            return
+
+        correction_forward_cm = current.y_cm - target.y_cm
+        correction_strafe_cm = current.x_cm - target.x_cm
+        done = self._home_world_vector_move(
+            correction_forward_cm,
+            correction_strafe_cm,
+            f"{side_name} scan setpoint one-shot polish",
+        )
+        result = str(done.get("result", ""))
+        if result not in MAP_MOVE_OK_RESULTS:
+            raise RuntimeError(
+                f"scan setpoint polish failed: {result or done.get('message', 'unknown')}"
+            )
+        completed_s = time.monotonic()
+        if self.home_settle_s > 0.0:
+            time.sleep(self.home_settle_s)
+        self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+        current = self._current_map_estimate()
+        residual_x_cm = target.x_cm - current.x_cm
+        residual_y_cm = target.y_cm - current.y_cm
+        self._publish_event(
+            f"{side_name} scan setpoint residual: "
+            f"map_error_x={residual_x_cm:.1f}cm map_error_y={residual_y_cm:.1f}cm"
+        )
+        if abs(residual_x_cm) > tolerance_cm or abs(residual_y_cm) > tolerance_cm:
+            raise RuntimeError(
+                f"scan setpoint residual too high x={residual_x_cm:.1f}cm y={residual_y_cm:.1f}cm"
+            )
+        self.map_pose = target
+
     def _execute_rotation_in_place(self, direction: str, degrees: float, label: str) -> None:
         self._raise_if_cancelled()
         direction = direction.lower()
@@ -1461,12 +1517,12 @@ class RobotManager(Node):
     def _scan_shelf_side(
         self,
         side: int,
-        shelf_ids_by_side: dict[int, str],
-        expected_counts_by_side: dict[int, int],
+        shelf_id: str,
+        expected_count: int,
     ) -> None:
         self._raise_if_cancelled()
-        shelf_id = shelf_ids_by_side.get(side, self.audit_shelf_ids.get(side, ""))
-        expected_count = max(1, int(expected_counts_by_side.get(side, self.audit_default_expected_count)))
+        shelf_id = str(shelf_id).strip() or self.audit_shelf_ids.get(side, "")
+        expected_count = max(1, int(expected_count))
         if not shelf_id:
             raise RuntimeError(f"no shelf id configured for side {side}")
 
@@ -1552,9 +1608,7 @@ class RobotManager(Node):
 
     def _run_map_audit(
         self,
-        sides: list[int],
-        shelf_ids_by_side: dict[int, str],
-        expected_counts_by_side: dict[int, int],
+        steps: list[AuditStep],
     ) -> None:
         try:
             with self.mode_lock:
@@ -1565,18 +1619,24 @@ class RobotManager(Node):
             self._publish_event(
                 "map mission start "
                 f"size={AudixStoreMap.WIDTH_CM:.0f}x{AudixStoreMap.HEIGHT_CM:.0f}cm "
-                f"sides={sides} single_level_scan=true shelf_ids={shelf_ids_by_side} counts={expected_counts_by_side}"
+                f"steps={[{'side': step.side, 'shelf_id': step.shelf_id, 'count': step.expected_count} for step in steps]} "
+                "single_level_scan=true"
             )
 
-            for side in sides:
+            for step_index, step in enumerate(steps, start=1):
                 self._raise_if_cancelled()
+                side = step.side
                 self._go_to_audit_side(side)
+                self._polish_scan_setpoint(side)
                 scan_heading = AudixStoreMap.SCAN_HEADING_DEG[side]
                 side_scans_complete = False
                 self._set_traffic_light("green")
                 try:
-                    self._execute_rotation_to_heading(scan_heading, f"face {AudixStoreMap.SIDE_NAME[side]}")
-                    self._scan_shelf_side(side, shelf_ids_by_side, expected_counts_by_side)
+                    self._execute_rotation_to_heading(
+                        scan_heading,
+                        f"mission step {step_index} face {AudixStoreMap.SIDE_NAME[side]}",
+                    )
+                    self._scan_shelf_side(side, step.shelf_id, step.expected_count)
                     side_scans_complete = True
                 finally:
                     self._set_traffic_light("yellow")
@@ -1781,8 +1841,30 @@ class RobotManager(Node):
         return response
 
     def _handle_start_audit(self, request: AuditMission.Request, response: AuditMission.Response) -> AuditMission.Response:
-        sides = [int(side) for side in request.shelves if 1 <= int(side) <= 2]
-        if not sides:
+        steps: list[AuditStep] = []
+        previous_side: int | None = None
+        for index, raw_side in enumerate(request.shelves):
+            side = int(raw_side)
+            if side not in {1, 2}:
+                continue
+            if previous_side == side:
+                response.accepted = False
+                response.message = f"mission cannot visit lane {side} twice in a row"
+                return response
+            shelf_id = self.audit_shelf_ids.get(side, "")
+            if index < len(request.shelf_ids):
+                requested_shelf_id = str(request.shelf_ids[index]).strip()
+                if requested_shelf_id:
+                    shelf_id = requested_shelf_id
+            expected_count = self.audit_default_expected_count
+            if index < len(request.expected_counts):
+                requested_count = int(request.expected_counts[index])
+                if requested_count > 0:
+                    expected_count = requested_count
+            steps.append(AuditStep(side=side, shelf_id=shelf_id, expected_count=expected_count))
+            previous_side = side
+
+        if not steps:
             response.accepted = False
             response.message = "select at least one shelf side"
             return response
@@ -1792,35 +1874,18 @@ class RobotManager(Node):
             response.message = "mission already running"
             return response
 
-        shelf_ids_by_side = dict(self.audit_shelf_ids)
-        expected_counts_by_side = {
-            1: self.audit_default_expected_count,
-            2: self.audit_default_expected_count,
-        }
-        for index, raw_side in enumerate(request.shelves):
-            side = int(raw_side)
-            if side not in {1, 2}:
-                continue
-            if index < len(request.shelf_ids):
-                shelf_id = str(request.shelf_ids[index]).strip()
-                if shelf_id:
-                    shelf_ids_by_side[side] = shelf_id
-            if index < len(request.expected_counts):
-                expected_count = int(request.expected_counts[index])
-                if expected_count > 0:
-                    expected_counts_by_side[side] = expected_count
-
         self.cancel_mission.clear()
         self.mission_running = True
         threading.Thread(
             target=self._run_map_audit,
-            args=(sides, shelf_ids_by_side, expected_counts_by_side),
+            args=(steps,),
             daemon=True,
         ).start()
         response.accepted = True
         response.message = (
-            f"audit mission started sides={sides} "
-            f"shelf_ids={shelf_ids_by_side} counts={expected_counts_by_side} single_level_scan=true"
+            f"audit mission started steps="
+            f"{[{'side': step.side, 'shelf_id': step.shelf_id, 'count': step.expected_count} for step in steps]} "
+            "single_level_scan=true"
         )
         return response
 
